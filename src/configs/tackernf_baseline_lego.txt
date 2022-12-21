@@ -1,0 +1,35 @@
+expname = tackernf_baseline_lego
+dataset_dir = lego
+dataset_type = blender
+dataset_root = data
+log_root = log
+
+white_bkgd = True
+
+lrate = 3e-3
+lrate_decay = 30000
+lrate_warmup_steps = 1000
+N_samples = 512
+N_importance = 0
+N_rand = 4096
+N_iters = 1000
+i_img = 2000
+i_img_ids = [1]
+i_testset = 10000
+i_video = 80000
+i_print=100
+i_wandb=0
+
+lossfn = mse
+
+image_downscale_factor = 1
+image_downscale_filter = antialias
+scene_scale = 0.8
+
+dim_grid = 256
+
+model = TackerNF
+tacker_rank=6
+init_method = normal
+dtype = float32
+checks = 0
