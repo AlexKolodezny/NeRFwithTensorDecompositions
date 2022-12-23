@@ -101,7 +101,7 @@ class BaseNF(nn.Module):
         )
 
         wa = coords_xyz - coo_left_bottom_near
-        wb = coords_xyz - coo_right_up_far
+        wb = coo_right_up_far  - coords_xyz
 
         wx, wy, wz = tuple(
             torch.stack([wa[:,i], wb[:,i]], dim=1)

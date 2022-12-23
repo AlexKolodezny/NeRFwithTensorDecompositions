@@ -40,7 +40,6 @@ class SkeletonNF(BaseNF):
 
     def reset_parameters(self) -> None:
         std = self.calculate_std()
-        print("Std", std)
         for i, _ in enumerate(self.vectors):
             nn.init.normal_(self.vectors[i], mean=0, std=std)
             nn.init.normal_(self.matrices[i], mean=0, std=std)
@@ -52,8 +51,6 @@ class SkeletonNF(BaseNF):
 
         coords_xyz = coords_xyz / (self.dim_grid - 1) * 2 - 1
         
-        # scene_coo_cube = coo_cube / (self.dim_grid - 1) * 2 - 1
-
         Ms = [
             F.grid_sample(
                 matrix[None,:,:,:],
@@ -61,11 +58,6 @@ class SkeletonNF(BaseNF):
                 align_corners=True).squeeze().T
             for (x, y, z), matrix in zip([(0, 1, 2), (1, 0, 2), (2, 0, 1)], self.matrices)
         ]
-
-        # Ms = [
-        #     matrix[coo_cube[:,y].detach(),coo_cube[:,z].detach()]
-        #     for (x, y, z), matrix in zip([(0, 1, 2), (1, 0, 2), (2, 0, 1)], self.matrices)
-        # ]
 
         results = [
             (batched_indexed_gemv(

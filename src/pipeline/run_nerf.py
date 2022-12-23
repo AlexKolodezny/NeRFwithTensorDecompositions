@@ -51,6 +51,7 @@ def create_model(args):
         'raw_noise_std': args.raw_noise_std,
         'expand_pdf_value': args.expand_pdf_value,
         'checks': args.checks,
+        'use_rgb_sigmoid': args.use_rgb_sigmoid,
     }
 
     print('Not ndc!')
@@ -71,14 +72,20 @@ def march_rays(
         white_bkgd=False,
         ret_weights=False,
         use_new_integration=True,
+        use_rgb_sigmoid=None,
 ):
+    assert use_rgb_sigmoid is not None
+
     NR, NS = raw_sigma.shape
 
     if raw_noise_std > 0.:
         raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
 
     sigma = F.relu(raw_sigma)  # NR x NS
-    rgb = torch.sigmoid(raw_rgb)  # NR x NS x 3
+    if use_rgb_sigmoid:
+        rgb = torch.sigmoid(raw_rgb)  # NR x NS x 3
+    else:
+        rgb = raw_rgb
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
 
@@ -113,6 +120,7 @@ def render_rays(
         sigma_warmup_numsteps=None,
         cur_step=None,
         checks=True,
+        use_rgb_sigmoid=None,
 ):
     """
     Volumetric rendering.
@@ -176,7 +184,7 @@ def render_rays(
 
     raw_rgb, raw_sigma = sample_rays(pts, viewdirs)
 
-    out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=N_importance > 0)
+    out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=N_importance > 0, use_rgb_sigmoid=use_rgb_sigmoid)
 
     if N_importance > 0:
         weights = out['weights']
@@ -200,7 +208,7 @@ def render_rays(
 
         raw_rgb, raw_sigma = sample_rays(pts, viewdirs)
 
-        out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=False)
+        out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=False, use_rgb_sigmoid=use_rgb_sigmoid)
         out['rgb_map0'] = rgb_map0
 
     return out
@@ -375,6 +383,8 @@ def config_parser():
                         help='voxel grid initialization')
     parser.add_argument("--grid_type", type=str, default='fused', choices=('fused', 'separate'),
                         help='type of voxel grid compression')
+    parser.add_argument("--use_rgb_sigmoid", type=int, default=1,
+                        help='use sigmoid on rgb')
     
     # Tacker voxel configuration
     parser.add_argument("--tacker_rank", type=int, default=64,
