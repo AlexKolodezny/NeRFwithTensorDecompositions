@@ -110,6 +110,10 @@ class BaseNF(nn.Module):
 
         return xs, ys, zs, wx, wy, wz
     
+    
+    def coords_to_tensor(self, coords_xyz: Tensor) -> Tensor:
+        return (coords_xyz + 1) * (0.5 * (self.dim_grid - 1))
+    
 
     def sample_with_outlier_handling(self, coords_xyz: Tensor) -> Tensor:
         """
@@ -145,5 +149,5 @@ class BaseNF(nn.Module):
         :param coords_xyz (torch.Tensor): sampled float points of shape [batch_rays x 3] in cube [0, dim_grid-1]^3
         :return:
         """
-        return self.sample_with_outlier_handling(coords_xyz)
+        return self.sample_with_outlier_handling(self.coords_to_tensor(coords_xyz))
         

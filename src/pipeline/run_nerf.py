@@ -1,5 +1,6 @@
 import random
 from warnings import warn
+import numpy as np
 
 import imageio
 from tqdm import tqdm, trange
@@ -26,11 +27,18 @@ def create_model(args):
     #     model.vox_fused.init_with_decomposition(state_dict['module.vox_fused.voxels'])
     #     print(f'Initializing weights using TT-SVD from: {args.init_model_ttsvd} ... Success')
 
-    optimizer = torch.optim.Adam(
-        params=model.get_param_groups(),
-        lr=args.lrate,
-        betas=(0.9, 0.999),
-    )
+
+    if args.optimizer == "Adam":
+        optimizer = torch.optim.Adam(
+            params=model.get_param_groups(),
+            lr=args.lrate,
+            betas=(0.9, 0.999),
+        )
+    elif args.optimizer == "SGD":
+        optimizer = torch.optim.SGD(
+            params=model.get_param_groups(),
+            lr=args.lrate,
+        )
 
     if args.parallel:
         model = torch.nn.DataParallel(model).to(args.device)
@@ -52,6 +60,8 @@ def create_model(args):
         'expand_pdf_value': args.expand_pdf_value,
         'checks': args.checks,
         'use_rgb_sigmoid': args.use_rgb_sigmoid,
+        'use_lrf': args.lossfn == 'lrf',
+        'sigma_activation': args.sigma_activation,
     }
 
     print('Not ndc!')
@@ -60,6 +70,7 @@ def create_model(args):
     render_kwargs_test = {k: render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = 0
     render_kwargs_test['raw_noise_std'] = 0.
+    render_kwargs_test['use_lrf'] = False
 
     return model, render_kwargs_train, render_kwargs_test, optimizer
 
@@ -105,8 +116,89 @@ def march_rays(
     return out
 
 
+def log_integrate(log_passed, log_not_passed):
+    log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
+    log_alpha = log_not_passed  # NR x NS
+    cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
+    return torch.cat([log_alpha + cum_log_att_exclusive, log_passed.sum(dim=1)[:,None]], dim=1)
+
+
+def march_rays_lrf(
+        raw_rgb,
+        raw_sigma,
+        z_vals,
+        targets,
+        raw_noise_std=0.,
+        white_bkgd=False,
+        ret_weights=False,
+        use_new_integration=True,
+        use_rgb_sigmoid=None,
+        sigma_activation='logloss',
+):
+    assert use_rgb_sigmoid is not None
+    assert sigma_activation == 'logloss'
+
+    NR, NS = raw_sigma.shape
+
+    print(raw_sigma.sum(), raw_rgb.sum())
+
+    if raw_noise_std > 0.:
+        raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
+
+    dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
+    # print((dists.max(1)[0] - dists.min(1)[0]).max())
+    dists = F.pad(dists, (0, 1), mode='constant', value=torch.finfo(dists.dtype).max)  # NR x NS
+
+    sigma = raw_sigma * dists
+    log_passed = -torch.logaddexp(raw_sigma, torch.zeros_like(raw_sigma))
+    log_not_passed = -torch.logaddexp(-raw_sigma, torch.zeros_like(raw_sigma))
+
+    # print(log_passed.sum(), log_not_passed.sum())
+
+    if use_rgb_sigmoid:
+        rgb = torch.sigmoid(raw_rgb)  # NR x NS x 3
+    else:
+        rgb = raw_rgb
+
+    log_weights = log_integrate(log_passed, log_not_passed)
+    weights = log_weights.exp()
+
+    norm_sigma = torch.ones(1, device=raw_sigma.device)
+
+    bkgd_color = 1 if white_bkgd else 0
+    rgb = F.pad(rgb, (0, 0, 0, 1), mode="constant", value=bkgd_color)
+    # print(log_weights.sum())
+
+    log_p = -1.5 * torch.log(norm_sigma) - 1/(2 * norm_sigma) * torch.sum((rgb - targets[:,None,:])**2, dim=2) + log_weights
+    q = torch.softmax(log_p, dim=1).detach()
+    log_q = F.log_softmax(log_p, dim=1).detach()
+    # print((log_weights != float("inf")).sum())
+    # print(q.sum())
+    # print(log_p.sum())
+
+    # q = log_p.exp()
+    # q /= q.sum(dim=1)
+
+    elbo = (log_p * q).sum() - (q * log_q).sum()
+    print("ELBO: ", elbo.item())
+
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+    # rgb_map = rgb_map + bkgd_color * (1. - acc_map[..., None])
+
+    out = {
+        'rgb_map': rgb_map,
+        'losses': torch.sum(-torch.where(q == 0, torch.zeros_like(q), log_p * q), dim=1)
+    }
+    # print(out['losses'].sum())
+    if ret_weights:
+        out['weights'] = weights
+
+    return out
+
+
 def render_rays(
         ray_batch,
+        target_batch,
         model,
         N_samples,
         use_viewdirs=False,
@@ -121,6 +213,8 @@ def render_rays(
         cur_step=None,
         checks=True,
         use_rgb_sigmoid=None,
+        use_lrf=None,
+        sigma_activation='relu',
 ):
     """
     Volumetric rendering.
@@ -162,12 +256,8 @@ def render_rays(
     if use_viewdirs:
         viewdirs = rays_d.clone()
 
-    grid_radius = (dim_grid - 1) * 0.5
-    rays_o.mul_(grid_radius)
-    rays_o.add_(grid_radius)
-
-    t_far = torch.linspace(0., grid_radius, steps=N_samples, device=device)
-    t_near = grid_radius - t_far
+    t_far = torch.linspace(0., 1.0, steps=N_samples, device=device)
+    t_near = 1.0 - t_far
     z_vals = near * t_near + far * t_far
     z_vals = z_vals.expand([N_rays, N_samples])
 
@@ -184,7 +274,20 @@ def render_rays(
 
     raw_rgb, raw_sigma = sample_rays(pts, viewdirs)
 
-    out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=N_importance > 0, use_rgb_sigmoid=use_rgb_sigmoid)
+    if use_lrf:
+        assert N_importance == 0
+        out = march_rays_lrf(
+            raw_rgb,
+            raw_sigma,
+            z_vals,
+            target_batch,
+            raw_noise_std,
+            white_bkgd,
+            ret_weights=N_importance > 0,
+            use_rgb_sigmoid=use_rgb_sigmoid,
+            sigma_activation=sigma_activation)
+    else:
+        out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=N_importance > 0, use_rgb_sigmoid=use_rgb_sigmoid)
 
     if N_importance > 0:
         weights = out['weights']
@@ -214,10 +317,11 @@ def render_rays(
     return out
 
 
-def render_rays_chunks(rays_flat, chunk, **kwargs):
+def render_rays_chunks(rays_flat, chunk, targets, **kwargs):
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i + chunk], **kwargs)
+        target_batch = targets[i:i+chunk] if targets is not None else None
+        ret = render_rays(rays_flat[i:i + chunk], target_batch, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -228,7 +332,7 @@ def render_rays_chunks(rays_flat, chunk, **kwargs):
 
 
 def render(
-        H, W, K, chunk, rays=None, c2w=None, ndc=True, near=None, far=None,
+        H, W, K, chunk, rays=None, targets=None, c2w=None, ndc=True, near=None, far=None,
         adjust_near_far=False, filter_rays=False, dir_center_pix=True,
         sigma_warmup_sts=False,
         sigma_warmup_numsteps=None,
@@ -243,6 +347,7 @@ def render(
       K: Tensor. Camera intrinsics matrix
       chunk: int. Maximum number of rays to process simultaneously. Used to control maximum memory usage.
       rays: array of shape [2, batch_size, 3]. Ray origin and direction for each example in batch.
+      targets: TODO,
       c2w: array of shape [3, 4]. Camera-to-world transformation matrix.
       ndc: bool. If True, represent ray origin, direction in NDC coordinates.
       near: float. Nearest distance for a ray.
@@ -253,6 +358,7 @@ def render(
     Returns:
       rgb_map: [batch_size, 3]. Predicted RGB values for rays.
       extras: dict with everything returned by render_rays().
+      loss: loss for batch
     """
     near_vec, far_vec, valid_mask = None, None, None
     if c2w is not None:
@@ -280,7 +386,7 @@ def render(
 
     # Render
     all_ret = render_rays_chunks(
-        rays, chunk,
+        rays, chunk, targets,
         sigma_warmup_sts=sigma_warmup_sts,
         sigma_warmup_numsteps=sigma_warmup_numsteps,
         cur_step=cur_step,
@@ -385,6 +491,8 @@ def config_parser():
                         help='type of voxel grid compression')
     parser.add_argument("--use_rgb_sigmoid", type=int, default=1,
                         help='use sigmoid on rgb')
+    parser.add_argument("--sigma_activation", type=str, default='relu', choices=('relu', 'logloss'),
+                        help='sigma activation')
     
     # Tacker voxel configuration
     parser.add_argument("--tacker_rank", type=int, default=64,
@@ -440,8 +548,12 @@ def config_parser():
                         help='specific weights npy file to initialize model weights')
     parser.add_argument("--init_model_ttsvd", type=str, default=None,
                         help='weights of a full voxel grid of compatible configuration')
-    parser.add_argument("--lossfn", type=str, default='huber', choices=('mse', 'huber'),
+    parser.add_argument("--lossfn", type=str, default='huber', choices=('mse', 'huber', 'lrf'),
                         help='loss function to use during training')
+    parser.add_argument("--train_size", type=int, default=None,
+                        help='number of rays for train')
+    parser.add_argument("--optimizer", type=str, default="Adam", choices=('Adam', 'SGD'),
+                        help='specify optimizer')
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64,
@@ -681,7 +793,12 @@ def train():
     #     'compression_factor': model.module.compression_factor,
     # }, global_step=0)
 
-    id_sampler = iter(ScramblingSampler(ds_target.shape[0], args.N_rand))
+    if args.train_size is not None:
+        id_sampler = iter(ScramblingSampler(
+            np.random.permutation(ds_target.shape[0])[:args.train_size],
+            args.N_rand))
+    else:
+        id_sampler = iter(ScramblingSampler(ds_target.shape[0], args.N_rand))
 
     model.train()
     for i in trange(0, args.N_iters + 1, disable=not args.i_tqdm):
@@ -700,6 +817,7 @@ def train():
             H, W, K,
             chunk=args.chunk,
             rays=batch_rays,
+            targets=target,
             sigma_warmup_sts=args.sigma_warmup_sts,
             sigma_warmup_numsteps=args.sigma_warmup_numsteps,
             cur_step=i,
@@ -708,10 +826,15 @@ def train():
 
         optimizer.zero_grad()
 
-        img_loss = {
-            'huber': F.huber_loss,
-            'mse': F.mse_loss,
-        }[args.lossfn](out['rgb_map'], target)
+        if args.lossfn == 'lrf':
+            img_loss = torch.sum(out['losses'])
+        else:
+            img_loss = {
+                'huber': F.huber_loss,
+                'mse': F.mse_loss,
+            }[args.lossfn](out['rgb_map'], target)
+        
+        mse_loss = F.mse_loss(out['rgb_map'], target)
 
         loss = img_loss
 
@@ -737,10 +860,10 @@ def train():
                 'LR': new_lrate,
             }
             msg = f"[TRAIN] Iter: {i} of {args.N_iters}, loss: {loss.item()}"
-            if args.lossfn == 'mse':
-                psnr = mse2psnr(img_loss)
-                vals['psnr'] = psnr
-                msg += f', PSNR: {psnr.item()}'
+            # if args.lossfn == 'mse':
+            psnr = mse2psnr(mse_loss)
+            vals['psnr'] = psnr
+            msg += f', PSNR: {psnr.item()}'
             tqdm.write(msg)
             # tb_add_scalars(tb, 'train', vals, global_step=i)
 
