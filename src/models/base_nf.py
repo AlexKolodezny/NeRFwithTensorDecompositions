@@ -49,7 +49,7 @@ class BaseNF(nn.Module):
         dim_grid,
         dim_payload,
         outliers_handling="zeros",
-            
+        return_mask=False,
     ) -> None:
         # assert len(dim_grid) == len(ranks)
         self.dim = 3
@@ -63,6 +63,7 @@ class BaseNF(nn.Module):
         self.dim_grid = dim_grid
         self.shape = (dim_grid,) * self.dim
         self.output_features = dim_payload
+        self.return_mask = return_mask
 
     
     def calc_params(self):
@@ -136,6 +137,8 @@ class BaseNF(nn.Module):
         if self.outliers_handling == 'zeros' and mask_need_remap:
             out_sparse = torch.zeros(batch_size, self.output_features, dtype=coords_xyz.dtype, device=coords_xyz.device)
             out_sparse[mask_valid] = result
+            if self.return_mask:
+                return out_sparse, mask_valid
             return out_sparse
 
         return result

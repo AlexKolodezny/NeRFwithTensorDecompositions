@@ -1,6 +1,7 @@
 import random
 from warnings import warn
 import numpy as np
+from itertools import cycle
 
 import imageio
 from tqdm import tqdm, trange
@@ -29,16 +30,25 @@ def create_model(args):
 
 
     if args.optimizer == "Adam":
-        optimizer = torch.optim.Adam(
+        optimizers = [torch.optim.Adam(
             params=model.get_param_groups(),
             lr=args.lrate,
             betas=(0.9, 0.999),
-        )
+        )]
     elif args.optimizer == "SGD":
-        optimizer = torch.optim.SGD(
+        optimizers = [torch.optim.SGD(
             params=model.get_param_groups(),
             lr=args.lrate,
-        )
+        )]
+    elif args.optimizer == "SeparatedSGD":
+        optimizers = [
+            torch.optim.SGD(
+                params=[{"params": [param], "tag": group["tag"], "lr": group["lr"]}],
+                lr=args.lrate,
+            )
+            for group in model.get_param_groups()
+            for param in group["params"]
+        ]
 
     if args.parallel:
         model = torch.nn.DataParallel(model).to(args.device)
@@ -62,6 +72,8 @@ def create_model(args):
         'use_rgb_sigmoid': args.use_rgb_sigmoid,
         'use_lrf': args.lossfn == 'lrf',
         'sigma_activation': args.sigma_activation,
+        'gamma_a_reg': args.gamma_a_reg,
+        'gamma_b_reg': args.gamma_b_reg,
     }
 
     print('Not ndc!')
@@ -72,7 +84,7 @@ def create_model(args):
     render_kwargs_test['raw_noise_std'] = 0.
     render_kwargs_test['use_lrf'] = False
 
-    return model, render_kwargs_train, render_kwargs_test, optimizer
+    return model, render_kwargs_train, render_kwargs_test, optimizers
 
 
 def march_rays(
@@ -126,6 +138,8 @@ def log_integrate(log_passed, log_not_passed):
 def march_rays_lrf(
         raw_rgb,
         raw_sigma,
+        raw_var,
+        mask,
         z_vals,
         targets,
         raw_noise_std=0.,
@@ -134,13 +148,15 @@ def march_rays_lrf(
         use_new_integration=True,
         use_rgb_sigmoid=None,
         sigma_activation='logloss',
+        gamma_a_reg = None,
+        gamma_b_reg = None,
 ):
     assert use_rgb_sigmoid is not None
     assert sigma_activation == 'logloss'
 
     NR, NS = raw_sigma.shape
 
-    print(raw_sigma.sum(), raw_rgb.sum())
+    # print(raw_sigma.sum(), raw_rgb.sum())
 
     if raw_noise_std > 0.:
         raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
@@ -148,6 +164,9 @@ def march_rays_lrf(
     dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
     # print((dists.max(1)[0] - dists.min(1)[0]).max())
     dists = F.pad(dists, (0, 1), mode='constant', value=torch.finfo(dists.dtype).max)  # NR x NS
+
+    raw_sigma = torch.where(mask, raw_sigma, torch.full_like(raw_sigma, -float("inf")))
+    mask = F.pad(mask, (0, 1), mode="constant", value=True)
 
     sigma = raw_sigma * dists
     log_passed = -torch.logaddexp(raw_sigma, torch.zeros_like(raw_sigma))
@@ -166,15 +185,23 @@ def march_rays_lrf(
     norm_sigma = torch.ones(1, device=raw_sigma.device)
 
     bkgd_color = 1 if white_bkgd else 0
-    rgb = F.pad(rgb, (0, 0, 0, 1), mode="constant", value=bkgd_color)
-    # print(log_weights.sum())
 
-    log_p = -1.5 * torch.log(norm_sigma) - 1/(2 * norm_sigma) * torch.sum((rgb - targets[:,None,:])**2, dim=2) + log_weights
+    log_var = raw_var
+    var = raw_var.exp()
+    # print((1 / (2 * var) * torch.sum((rgb - targets[:,None,:]**2), dim=2))[0,:20])
+    # print((1 / (2 * var))[0,:20])
+    # print((torch.sum((rgb - targets[:,None,:]**2), dim=2))[0,:20])
+    # print(log_weights[0,:20])
+
+    log_p = torch.where(
+        mask,
+        (1.5 + gamma_a_reg - 1) * log_var - var / 2 * (torch.sum((rgb - targets[:,None,:])**2, dim=2) + gamma_b_reg) + log_weights,
+        torch.zeros_like(raw_var)
+    )
     q = torch.softmax(log_p, dim=1).detach()
     log_q = F.log_softmax(log_p, dim=1).detach()
     # print((log_weights != float("inf")).sum())
     # print(q.sum())
-    # print(log_p.sum())
 
     # q = log_p.exp()
     # q /= q.sum(dim=1)
@@ -215,6 +242,8 @@ def render_rays(
         use_rgb_sigmoid=None,
         use_lrf=None,
         sigma_activation='relu',
+        gamma_a_reg=None,
+        gamma_b_reg=None,
 ):
     """
     Volumetric rendering.
@@ -244,10 +273,10 @@ def render_rays(
         :param inputs (torch.Tensor): sampled points of shape [batch x ray x 3]
         :param viewdirs (torch.Tensor): directions corresponding to inputs rays of shape [batch x 3]
         """
-        rgb, sigma = model(inputs, viewdirs)
+        rgb, sigma, std, mask = model(inputs, viewdirs)
         if sigma_warmup_sts and cur_step <= sigma_warmup_numsteps:
             sigma *= cur_step / sigma_warmup_numsteps
-        return rgb, sigma
+        return rgb, sigma, std, mask
 
     N_rays, device = ray_batch.shape[0], ray_batch.device
     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]
@@ -272,19 +301,23 @@ def render_rays(
 
     pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
-    raw_rgb, raw_sigma = sample_rays(pts, viewdirs)
+    raw_rgb, raw_sigma, raw_var, mask = sample_rays(pts, viewdirs)
 
     if use_lrf:
         assert N_importance == 0
         out = march_rays_lrf(
             raw_rgb,
             raw_sigma,
+            raw_var,
+            mask,
             z_vals,
             target_batch,
             raw_noise_std,
             white_bkgd,
             ret_weights=N_importance > 0,
             use_rgb_sigmoid=use_rgb_sigmoid,
+            gamma_a_reg=gamma_a_reg,
+            gamma_b_reg=gamma_b_reg,
             sigma_activation=sigma_activation)
     else:
         out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=N_importance > 0, use_rgb_sigmoid=use_rgb_sigmoid)
@@ -481,6 +514,8 @@ def config_parser():
                         help='use DataParallel')
 
     # voxel grid configuration
+    parser.add_argument("--models", type=str,
+                        help='models of voxel frid in json')
     parser.add_argument("--model", type=str, default="QTTNF", choices=("QTTNF", "TackerNF", "VMNF", "SkeletonNF"),
                         help='model of voxel frid')
     parser.add_argument("--dim_grid", type=int, default=256,
@@ -493,6 +528,8 @@ def config_parser():
                         help='use sigmoid on rgb')
     parser.add_argument("--sigma_activation", type=str, default='relu', choices=('relu', 'logloss'),
                         help='sigma activation')
+    parser.add_argument("--gamma_a_reg", type=float, default=1.)
+    parser.add_argument("--gamma_b_reg", type=float, default=0.)
     
     # Tacker voxel configuration
     parser.add_argument("--tacker_rank", type=int, default=64,
@@ -552,7 +589,7 @@ def config_parser():
                         help='loss function to use during training')
     parser.add_argument("--train_size", type=int, default=None,
                         help='number of rays for train')
-    parser.add_argument("--optimizer", type=str, default="Adam", choices=('Adam', 'SGD'),
+    parser.add_argument("--optimizer", type=str, default="Adam", choices=('Adam', 'SGD', 'SeparatedSGD'),
                         help='specify optimizer')
 
     # rendering options
@@ -709,7 +746,7 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create model
-    model, render_kwargs_train, render_kwargs_test, optimizer = create_model(args)
+    model, render_kwargs_train, render_kwargs_test, optimizers = create_model(args)
     global_step = 0
 
     bds_dict = {
@@ -801,7 +838,7 @@ def train():
         id_sampler = iter(ScramblingSampler(ds_target.shape[0], args.N_rand))
 
     model.train()
-    for i in trange(0, args.N_iters + 1, disable=not args.i_tqdm):
+    for i, optimizer in zip(trange(0, args.N_iters + 1, disable=not args.i_tqdm), cycle(optimizers)):
         ids = next(id_sampler)
         rays_o = ds_rays_o[ids].to(args.device)
         rays_d = ds_rays_d[ids].to(args.device)
@@ -843,6 +880,7 @@ def train():
             loss = loss + img_loss0
 
         loss.backward()
+        # print(torch.linalg.norm(render_kwargs_train["model"].vox_var.tensor.grad))
         optimizer.step()
 
         decay_rate = 0.1

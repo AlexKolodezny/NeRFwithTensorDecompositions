@@ -1,15 +1,27 @@
 import math
 
 import torch
+import torch.nn.functional as F
+import json
+from copy import deepcopy
 
 from .helpers import positional_encoding
 from ..models.qttnf import QTTNF
 from ..models.tacker import TackerNF
 from ..models.vm import VMNF
 from ..models.skeleton import SkeletonNF
+from ..models.full import FullNF
 
 from ..models.spherical_harmonics import spherical_harmonics_bases
 
+model_dict = {
+    "QTTNF": QTTNF,
+    "TTNF": QTTNF,
+    "TackerNF": TackerNF,
+    "VNMF": VMNF,
+    "SkeletonNF": SkeletonNF,
+    "FullNF": FullNF,
+}
 
 class ShaderBase(torch.nn.Module):
     def forward(self, coords_xyz, viewdirs, feat_color):
@@ -128,66 +140,93 @@ class RadianceField(torch.nn.Module):
         self.shader_num_params = sum(torch.tensor(a.shape).prod().item() for a in self.shader.parameters())
 
 
-        if args.model == "QTTNF" or args.model == "TTNF":
-            kwargs = dict(
-                tt_rank_max=args.tt_rank_max,
-                sample_by_contraction=args.sample_by_contraction,
-                tt_rank_equal=args.tt_rank_equal,
-                tt_minimal_dof=args.tt_minimal_dof,
-                init_method=args.init_method,
-                outliers_handling='zeros',
-                expected_sample_batch_size=args.N_rand * (args.N_samples + args.N_importance),
-                version_sample_qtt=args.sample_qtt_version,
-                dtype={
-                    'float16': torch.float16,
-                    'float32': torch.float32,
-                    'float64': torch.float64,
-                }[args.dtype],
-                checks=args.checks,
-                verbose=True,
-            )
-            model=QTTNF
-        elif args.model == "TackerNF":
-            model = TackerNF
-            kwargs = dict(
-                tacker_rank=args.tacker_rank,
-                # init_method=args.init_method,
-                outliers_handling='zeros',
-                # expected_sample_batch_size=args.N_rand * (args.N_samples + args.N_importance),
-                # dtype={
-                #     'float16': torch.float16,
-                #     'float32': torch.float32,
-                #     'float64': torch.float64,
-                # }[args.dtype],
-                # checks=args.checks,
-                # verbose=True,
-            )
-        elif args.model == "VMNF":
-            model = VMNF
-            kwargs = dict(
-                vm_rank=args.vm_rank,
-                outliers_handling='zeros',
-            )
-        elif args.model == "SkeletonNF":
-            model = SkeletonNF
-            kwargs = dict(
-                skeleton_rank=args.skeleton_rank,
-                outliers_handling='zeros',
-            )
+        if args.models is None:
+            if args.model == "QTTNF" or args.model == "TTNF":
+                kwargs = dict(
+                    tt_rank_max=args.tt_rank_max,
+                    sample_by_contraction=args.sample_by_contraction,
+                    tt_rank_equal=args.tt_rank_equal,
+                    tt_minimal_dof=args.tt_minimal_dof,
+                    init_method=args.init_method,
+                    outliers_handling='zeros',
+                    expected_sample_batch_size=args.N_rand * (args.N_samples + args.N_importance),
+                    version_sample_qtt=args.sample_qtt_version,
+                    dtype={
+                        'float16': torch.float16,
+                        'float32': torch.float32,
+                        'float64': torch.float64,
+                    }[args.dtype],
+                    checks=args.checks,
+                    verbose=True,
+                )
+                model=QTTNF
+            elif args.model == "TackerNF":
+                model = TackerNF
+                kwargs = dict(
+                    tacker_rank=args.tacker_rank,
+                    # init_method=args.init_method,
+                    outliers_handling='zeros',
+                    # expected_sample_batch_size=args.N_rand * (args.N_samples + args.N_importance),
+                    # dtype={
+                    #     'float16': torch.float16,
+                    #     'float32': torch.float32,
+                    #     'float64': torch.float64,
+                    # }[args.dtype],
+                    # checks=args.checks,
+                    # verbose=True,
+                )
+            elif args.model == "VMNF":
+                model = VMNF
+                kwargs = dict(
+                    vm_rank=args.vm_rank,
+                    outliers_handling='zeros',
+                )
+            elif args.model == "SkeletonNF":
+                model = SkeletonNF
+                kwargs = dict(
+                    skeleton_rank=args.skeleton_rank,
+                    outliers_handling='zeros',
+                )
+            elif args.model == "FullNF":
+                model = FullNF
+                kwargs = dict(
+                    outliers_handling='zeros',
+                )
 
-        if args.grid_type == 'fused':
-            # opacity + 3 * (# sh or a float per channel)
-            dim_payload = 1 + 3 * (args.sh_basis_dim if args.use_viewdirs else 1)
-            self.vox_fused = model(args.dim_grid, dim_payload, **kwargs)
-        elif args.grid_type == 'separate':
-            # 3 * (# sh or a float per channel)
-            dim_payload = 3 * (args.sh_basis_dim if args.use_viewdirs else 1)
-            self.vox_rgb = model(
-                args.dim_grid, dim_payload, **kwargs
-            )
-            self.vox_sigma = model(args.dim_grid, 1, **kwargs)  # opacity
+            if args.grid_type == 'fused':
+                # opacity + 3 * (# sh or a float per channel)
+                dim_payload = 1 + 3 * (args.sh_basis_dim if args.use_viewdirs else 1)
+                self.vox_fused = model(args.dim_grid, dim_payload, **kwargs)
+            elif args.grid_type == 'separate':
+                # 3 * (# sh or a float per channel)
+                dim_payload = 3 * (args.sh_basis_dim if args.use_viewdirs else 1)
+                self.vox_rgb = model(
+                    args.dim_grid, dim_payload, **kwargs
+                )
+                self.vox_sigma = model(args.dim_grid, 1, **kwargs)  # opacity
+            else:
+                raise ValueError(f'Invalid voxel grid type "{args.grid_type}"')
         else:
-            raise ValueError(f'Invalid voxel grid type "{args.grid_type}"')
+            models_config = json.loads(args.models)
+            def create_model_kwargs(model_config):
+                config = deepcopy(model_config)
+                del config["model"]
+                config["outliers_handling"] ='zeros'
+                return config
+
+            dim_payload = 3 * (args.sh_basis_dim if args.use_viewdirs else 1)
+            self.vox_rgb = model_dict[models_config["rgb"]["model"]](
+                args.dim_grid, dim_payload, **create_model_kwargs(models_config["rgb"])
+            )
+            self.vox_sigma = model_dict[models_config["sigma"]["model"]](
+                args.dim_grid, 1, **create_model_kwargs(models_config["sigma"])
+            )
+            self.vox_var = model_dict[models_config["var"]["model"]](
+                args.dim_grid, 1, **create_model_kwargs(models_config["var"])
+            )
+            self.bkgd_rgb = 1. if args.white_bkgd else 0.
+            self.bkgd_var = torch.nn.Parameter(torch.tensor(1.))
+
 
     def forward(self, coords_xyz, viewdirs):
         if self.args.checks:
@@ -196,7 +235,13 @@ class RadianceField(torch.nn.Module):
         B, R, _ = coords_xyz.shape
         coords_xyz = coords_xyz.view(B * R, 3)
 
-        if self.args.grid_type == 'fused':
+        var = None
+        mask = None
+        if self.args.models is not None:
+            rgb = self.vox_rgb(coords_xyz)
+            sigma = self.vox_sigma(coords_xyz)
+            var, mask = self.vox_var(coords_xyz)
+        elif self.args.grid_type == 'fused':
             tmp = self.vox_fused(coords_xyz)
             rgb, sigma = tmp[..., :-1], tmp[..., -1]  # B x R x 3 * (SH or 1), B x R
         elif self.args.grid_type == 'separate':
@@ -207,11 +252,24 @@ class RadianceField(torch.nn.Module):
 
         rgb, sigma = rgb.view(B, R, -1), sigma.view(B, R)
         rgb = self.shader(coords_xyz, viewdirs, rgb)
-        return rgb, sigma
+        if self.args.models is not None:
+            var = var.view(B, R)
+            mask = mask.view(B, R)
+            rgb = F.pad(rgb, (0, 0, 0, 1), mode="constant", value=self.bkgd_rgb)
+            var = torch.cat([var, self.bkgd_var.expand(B, 1)], dim=1)
+        return rgb, sigma, var, mask
 
     def get_param_groups(self):
         out = []
-        if self.args.grid_type == 'fused':
+        if self.args.models is not None:
+            out += [
+                {'tag': 'vox', 'params': self.vox_rgb.parameters(), 'lr': self.args.lrate},
+                {'tag': 'vox', 'params': self.vox_sigma.parameters(), 'lr':
+                    self.args.lrate * self.args.lrate_sigma_multiplier},
+                {'tag': 'vox', 'params': self.vox_var.parameters(), 'lr': self.args.lrate},
+            ]
+
+        elif self.args.grid_type == 'fused':
             out += [
                 {'tag': 'vox', 'params': self.vox_fused.parameters(), 'lr': self.args.lrate},
             ]
@@ -221,9 +279,10 @@ class RadianceField(torch.nn.Module):
                 {'tag': 'vox', 'params': self.vox_sigma.parameters(), 'lr':
                     self.args.lrate * self.args.lrate_sigma_multiplier},
             ]
-        out += [
-            {'tag': 'shader', 'params': self.shader.parameters(), 'lr': self.args.lrate_shader},
-        ]
+        if self.args.shading_mode == "mlp":
+            out += [
+                {'tag': 'shader', 'params': self.shader.parameters(), 'lr': self.args.lrate_shader},
+            ]
         return out
 
     @property

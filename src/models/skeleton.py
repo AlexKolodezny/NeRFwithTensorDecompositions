@@ -11,12 +11,11 @@ class SkeletonNF(BaseNF):
         dim_grid,
         dim_payload,
         skeleton_rank=None,
-        outliers_handling="zeros",
-            
+        **kwargs,
     ) -> None:
         # assert len(dim_grid) == len(ranks)
         # factory_kwargs = {"device": device, "dtype": dtype}
-        super(SkeletonNF, self).__init__(dim_grid, dim_payload, outliers_handling=outliers_handling)
+        super(SkeletonNF, self).__init__(dim_grid, dim_payload, **kwargs)
 
         self.ranks = (skeleton_rank,) * self.dim
 
