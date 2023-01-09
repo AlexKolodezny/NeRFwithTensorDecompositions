@@ -183,7 +183,7 @@ class RadianceField(torch.nn.Module):
             # 3 * (# sh or a float per channel)
             dim_payload = 3 * (args.sh_basis_dim if args.use_viewdirs else 1)
             self.vox_rgb = model(
-                args.dim_grid, dim_payload, args.tt_rank_max, **kwargs
+                args.dim_grid, dim_payload, **kwargs
             )
             self.vox_sigma = model(args.dim_grid, 1, **kwargs)  # opacity
         else:
