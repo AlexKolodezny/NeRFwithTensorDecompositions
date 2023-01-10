@@ -115,11 +115,9 @@ def march_rays(
     integrate_fn = integrate_new if use_new_integration else integrate_old
     weights = integrate_fn(sigma, dists)  # NR x NS
 
-    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+    weights = torch.cat([weights, 1. - weights.sum(dim=1)[:,None]], dim=1)
 
-    if white_bkgd:
-        acc_map = torch.sum(weights, -1)
-        rgb_map = rgb_map + (1. - acc_map[..., None])
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
 
     out = {'rgb_map': rgb_map}
     if ret_weights:
@@ -207,7 +205,7 @@ def march_rays_lrf(
     # q /= q.sum(dim=1)
 
     elbo = (log_p * q).sum() - (q * log_q).sum()
-    print("ELBO: ", elbo.item())
+    # print("ELBO: ", elbo.item())
 
     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
     # rgb_map = rgb_map + bkgd_color * (1. - acc_map[..., None])
