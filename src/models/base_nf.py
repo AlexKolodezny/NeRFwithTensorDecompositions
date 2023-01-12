@@ -123,11 +123,14 @@ class BaseNF(nn.Module):
         """
 
         batch_size, _ = coords_xyz.shape
+        mask_valid = torch.all(coords_xyz >= 0, dim=1) & torch.all(coords_xyz <= self.dim_grid - 1, dim=1)
         if self.outliers_handling == 'zeros':
-            mask_valid = torch.all(coords_xyz >= 0, dim=1) & torch.all(coords_xyz <= self.dim_grid - 1, dim=1)
             coords_xyz = coords_xyz[mask_valid]
             if coords_xyz.shape[0] == 0:
-                return torch.zeros(batch_size, self.output_features, dtype=coords_xyz.dtype, device=coords_xyz.device)
+                if self.return_mask:
+                    return torch.zeros(batch_size, self.output_features, dtype=coords_xyz.dtype, device=coords_xyz.device), mask_valid
+                else:
+                    return torch.zeros(batch_size, self.output_features, dtype=coords_xyz.dtype, device=coords_xyz.device)
             mask_need_remap = coords_xyz.shape[0] < batch_size
         
 
@@ -141,6 +144,8 @@ class BaseNF(nn.Module):
                 return out_sparse, mask_valid
             return out_sparse
 
+        if self.return_mask:
+            return out_sparse, mask_valid
         return result
     
     def sample_tensor_points(self, coords_xyz):

@@ -10,6 +10,7 @@ class FullNF(BaseNF):
         dim_grid,
         dim_payload,
         init_method="normal",
+        constant=None,
         **kwargs,
     ) -> None:
         # assert len(dim_grid) == len(ranks)
@@ -18,6 +19,7 @@ class FullNF(BaseNF):
 
         self.tensor = nn.Parameter(torch.empty((1, dim_payload) + self.shape))
         self.init_method = init_method
+        self.constant = constant
 
         self.reset_parameters()
 
@@ -33,7 +35,7 @@ class FullNF(BaseNF):
             std = self.calculate_std()
             nn.init.normal_(self.tensor, mean=0, std=std)
         elif self.init_method == "constant":
-            nn.init.constant_(self.tensor, 1)
+            nn.init.constant_(self.tensor, self.constant)
 
     
     def sample_tensor_points(self, coords_xyz):

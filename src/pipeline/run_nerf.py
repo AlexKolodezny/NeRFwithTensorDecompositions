@@ -49,6 +49,12 @@ def create_model(args):
             for group in model.get_param_groups()
             for param in group["params"]
         ]
+    elif args.optimizer == "LBFGS":
+        optimizers = [torch.optim.LBFGS(
+            params=model.parameters(),
+            line_search_fn = 'strong_wolfe',
+        )]
+
 
     if args.parallel:
         model = torch.nn.DataParallel(model).to(args.device)
@@ -70,7 +76,7 @@ def create_model(args):
         'expand_pdf_value': args.expand_pdf_value,
         'checks': args.checks,
         'use_rgb_sigmoid': args.use_rgb_sigmoid,
-        'use_lrf': args.lossfn == 'lrf',
+        'lossfn': args.lossfn,
         'sigma_activation': args.sigma_activation,
         'gamma_a_reg': args.gamma_a_reg,
         'gamma_b_reg': args.gamma_b_reg,
@@ -82,7 +88,7 @@ def create_model(args):
     render_kwargs_test = {k: render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = 0
     render_kwargs_test['raw_noise_std'] = 0.
-    render_kwargs_test['use_lrf'] = False
+    render_kwargs_test['lossfn'] = None
 
     return model, render_kwargs_train, render_kwargs_test, optimizers
 
@@ -91,11 +97,14 @@ def march_rays(
         raw_rgb,
         raw_sigma,
         z_vals,
+        targets,
         raw_noise_std=0.,
         white_bkgd=False,
         ret_weights=False,
         use_new_integration=True,
         use_rgb_sigmoid=None,
+        sigma_activation=None,
+        lossfn=None,
 ):
     assert use_rgb_sigmoid is not None
 
@@ -104,7 +113,10 @@ def march_rays(
     if raw_noise_std > 0.:
         raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
 
-    sigma = F.relu(raw_sigma)  # NR x NS
+    if sigma_activation == 'relu':
+        sigma = F.relu(raw_sigma)  # NR x NS
+    elif sigma_activation == "logloss":
+        sigma = F.softplus(raw_sigma)
     if use_rgb_sigmoid:
         rgb = torch.sigmoid(raw_rgb)  # NR x NS x 3
     else:
@@ -119,9 +131,18 @@ def march_rays(
 
     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
 
-    out = {'rgb_map': rgb_map}
+    out = {'rgb_map': rgb_map.detach()}
     if ret_weights:
-        out['weights'] = weights
+        out['weights'] = weights.detach()
+
+    if lossfn is not None:
+        img_loss = {
+            'huber': F.huber_loss,
+            'mse': F.mse_loss,
+        }[lossfn](rgb_map, targets)
+        out['losses'] = img_loss[None].detach()
+
+        img_loss.backward()
 
     return out
 
@@ -145,7 +166,7 @@ def march_rays_lrf(
         ret_weights=False,
         use_new_integration=True,
         use_rgb_sigmoid=None,
-        sigma_activation='logloss',
+        sigma_activation=None,
         gamma_a_reg = None,
         gamma_b_reg = None,
 ):
@@ -210,13 +231,15 @@ def march_rays_lrf(
     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
     # rgb_map = rgb_map + bkgd_color * (1. - acc_map[..., None])
 
+    losses = torch.sum(-torch.where(q == 0, torch.zeros_like(q), log_p * q), dim=1)
     out = {
-        'rgb_map': rgb_map,
-        'losses': torch.sum(-torch.where(q == 0, torch.zeros_like(q), log_p * q), dim=1)
+        'rgb_map': rgb_map.detach(),
+        'losses': losses.detach(),
     }
-    # print(out['losses'].sum())
     if ret_weights:
-        out['weights'] = weights
+        out['weights'] = weights.detach()
+    # print(out['losses'].sum())
+    losses.backward()
 
     return out
 
@@ -238,7 +261,7 @@ def render_rays(
         cur_step=None,
         checks=True,
         use_rgb_sigmoid=None,
-        use_lrf=None,
+        lossfn=None,
         sigma_activation='relu',
         gamma_a_reg=None,
         gamma_b_reg=None,
@@ -301,7 +324,7 @@ def render_rays(
 
     raw_rgb, raw_sigma, raw_var, mask = sample_rays(pts, viewdirs)
 
-    if use_lrf:
+    if lossfn == 'lrf':
         assert N_importance == 0
         out = march_rays_lrf(
             raw_rgb,
@@ -318,7 +341,17 @@ def render_rays(
             gamma_b_reg=gamma_b_reg,
             sigma_activation=sigma_activation)
     else:
-        out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=N_importance > 0, use_rgb_sigmoid=use_rgb_sigmoid)
+        out = march_rays(
+            raw_rgb,
+            raw_sigma,
+            z_vals,
+            target_batch,
+            raw_noise_std,
+            white_bkgd,
+            lossfn=lossfn,
+            ret_weights=N_importance > 0,
+            use_rgb_sigmoid=use_rgb_sigmoid,
+            sigma_activation=sigma_activation)
 
     if N_importance > 0:
         weights = out['weights']
@@ -350,7 +383,7 @@ def render_rays(
 
 def render_rays_chunks(rays_flat, chunk, targets, **kwargs):
     all_ret = {}
-    for i in range(0, rays_flat.shape[0], chunk):
+    for i in trange(0, rays_flat.shape[0], chunk):
         target_batch = targets[i:i+chunk] if targets is not None else None
         ret = render_rays(rays_flat[i:i + chunk], target_batch, **kwargs)
         for k in ret:
@@ -834,7 +867,7 @@ def train():
             args.N_rand))
     else:
         id_sampler = iter(ScramblingSampler(ds_target.shape[0], args.N_rand))
-
+    
     model.train()
     for i, optimizer in zip(trange(0, args.N_iters + 1, disable=not args.i_tqdm), cycle(optimizers)):
         ids = next(id_sampler)
@@ -848,6 +881,8 @@ def train():
         else:
             batch_rays = [rays_o, rays_d]
 
+        optimizer.zero_grad()
+
         out = render(
             H, W, K,
             chunk=args.chunk,
@@ -859,25 +894,13 @@ def train():
             **render_kwargs_train
         )
 
-        optimizer.zero_grad()
-
-        if args.lossfn == 'lrf':
-            img_loss = torch.sum(out['losses'])
-        else:
-            img_loss = {
-                'huber': F.huber_loss,
-                'mse': F.mse_loss,
-            }[args.lossfn](out['rgb_map'], target)
-        
         mse_loss = F.mse_loss(out['rgb_map'], target)
 
-        loss = img_loss
+        # if args.N_importance > 0:
+        #     img_loss0 = img2mse(out['rgb_map0'], target)
+        #     loss = loss + img_loss0
 
-        if args.N_importance > 0:
-            img_loss0 = img2mse(out['rgb_map0'], target)
-            loss = loss + img_loss0
-
-        loss.backward()
+        # loss.backward()
         # print(torch.linalg.norm(render_kwargs_train["model"].vox_var.tensor.grad))
         optimizer.step()
 
@@ -891,6 +914,7 @@ def train():
 
         # Rest is logging
         if i % args.i_print == 0:
+            loss = out['losses'].mean()
             vals = {
                 'loss': loss,
                 'LR': new_lrate,
