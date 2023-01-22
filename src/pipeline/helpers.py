@@ -168,9 +168,11 @@ class ScramblingSampler:
         return self
 
     def __next__(self):
-        if self.curr + self.batch > self.total:
+        if self.batch == -1:
+            return self.ids
+        if self.curr + self.batch > len(self.ids):
             out = self.ids[self.curr:]
-            self.ids = torch.LongTensor(np.random.permutation(self.total))
+            self.ids = torch.LongTensor(np.random.permutation(self.ids))
             remaining = self.batch - out.shape[0]
             out = torch.cat((out, self.ids[:remaining]), dim=0)
             self.curr = remaining

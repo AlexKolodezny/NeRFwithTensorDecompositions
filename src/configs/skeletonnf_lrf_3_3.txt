@@ -1,0 +1,42 @@
+expname = skeletonnf_lrf_3_3
+dataset_dir = lego
+dataset_type = blender
+dataset_root = data
+log_root = log
+
+device = cuda:1
+chunk = 16000
+
+white_bkgd = True
+
+lrate = 1
+lrate_decay = 15000
+lrate_warmup_steps = 0
+N_samples = 128
+N_importance = 0
+N_rand = -1
+N_iters = 30000
+i_img = 2000
+i_img_ids = [1]
+i_testset = 30000
+i_video = 80000
+i_print=1
+i_wandb=0
+
+lossfn = mse
+
+image_downscale_factor = 8
+image_downscale_filter = antialias
+scene_scale = 0.8
+
+dim_grid = 128
+
+models = '{"rgb": {"model": "SkeletonNF","skeleton_rank": 8, "return_mask": 1}, "sigma": {"model": "FullNF", "init_method": "constant", "constant": 1, "outliers_handling": "inf"}}'
+
+optimizer=LBFGS
+use_rgb_sigmoid = 0
+perturb=0
+sigma_warmup_sts=0
+sigma_activation=logloss
+gamma_a_reg=1.
+gamma_b_reg=0.001

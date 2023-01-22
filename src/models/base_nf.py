@@ -49,13 +49,13 @@ class BaseNF(nn.Module):
         dim_grid,
         dim_payload,
         outliers_handling="zeros",
-            
+        return_mask=False,
     ) -> None:
         # assert len(dim_grid) == len(ranks)
         self.dim = 3
         self.dtype_sz_bytes = 4
         self.outliers_handling = outliers_handling
-        assert self.outliers_handling == "zeros", f"Unsupported outliers_handling {self.outliers_handling}"
+        assert self.outliers_handling in {"zeros", "inf"}, f"Unsupported outliers_handling {self.outliers_handling}"
 
         # factory_kwargs = {"device": device, "dtype": dtype}
         super(BaseNF, self).__init__()
@@ -63,6 +63,7 @@ class BaseNF(nn.Module):
         self.dim_grid = dim_grid
         self.shape = (dim_grid,) * self.dim
         self.output_features = dim_payload
+        self.return_mask = return_mask
 
     
     def calc_params(self):
@@ -110,6 +111,10 @@ class BaseNF(nn.Module):
 
         return xs, ys, zs, wx, wy, wz
     
+    
+    def coords_to_tensor(self, coords_xyz: Tensor) -> Tensor:
+        return (coords_xyz + 1) * (0.5 * (self.dim_grid - 1))
+    
 
     def sample_with_outlier_handling(self, coords_xyz: Tensor) -> Tensor:
         """
@@ -117,23 +122,34 @@ class BaseNF(nn.Module):
         :return:
         """
 
+        fill_value = {
+            "zeros": 0,
+            "inf": -float("inf"),
+        }[self.outliers_handling]
+
         batch_size, _ = coords_xyz.shape
-        if self.outliers_handling == 'zeros':
-            mask_valid = torch.all(coords_xyz >= 0, dim=1) & torch.all(coords_xyz <= self.dim_grid - 1, dim=1)
-            coords_xyz = coords_xyz[mask_valid]
-            if coords_xyz.shape[0] == 0:
-                return torch.zeros(batch_size, self.output_features, dtype=coords_xyz.dtype, device=coords_xyz.device)
-            mask_need_remap = coords_xyz.shape[0] < batch_size
+        mask_valid = torch.all(coords_xyz >= 0, dim=1) & torch.all(coords_xyz <= self.dim_grid - 1, dim=1)
+        coords_xyz = coords_xyz[mask_valid]
+        if coords_xyz.shape[0] == 0:
+            if self.return_mask:
+                return torch.full((batch_size, self.output_features), fill_value, dtype=coords_xyz.dtype, device=coords_xyz.device), mask_valid
+            else:
+                return torch.full((batch_size, self.output_features), fill_value, dtype=coords_xyz.dtype, device=coords_xyz.device)
+        mask_need_remap = coords_xyz.shape[0] < batch_size
         
 
         result = self.sample_tensor_points(coords_xyz)
 
         
-        if self.outliers_handling == 'zeros' and mask_need_remap:
-            out_sparse = torch.zeros(batch_size, self.output_features, dtype=coords_xyz.dtype, device=coords_xyz.device)
+        if mask_need_remap:
+            out_sparse = torch.full((batch_size, self.output_features), fill_value, dtype=coords_xyz.dtype, device=coords_xyz.device)
             out_sparse[mask_valid] = result
+            if self.return_mask:
+                return out_sparse, mask_valid
             return out_sparse
 
+        if self.return_mask:
+            return out_sparse, mask_valid
         return result
     
     def sample_tensor_points(self, coords_xyz):
@@ -145,5 +161,5 @@ class BaseNF(nn.Module):
         :param coords_xyz (torch.Tensor): sampled float points of shape [batch_rays x 3] in cube [0, dim_grid-1]^3
         :return:
         """
-        return self.sample_with_outlier_handling(coords_xyz)
+        return self.sample_with_outlier_handling(self.coords_to_tensor(coords_xyz))
         

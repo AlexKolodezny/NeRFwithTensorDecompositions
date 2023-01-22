@@ -1,8 +1,12 @@
 import random
 from warnings import warn
+import numpy as np
+from itertools import cycle
+import math
 
 import imageio
 from tqdm import tqdm, trange
+import wandb
 
 from .helpers import *
 from .load_blender import load_blender_data
@@ -26,11 +30,48 @@ def create_model(args):
     #     model.vox_fused.init_with_decomposition(state_dict['module.vox_fused.voxels'])
     #     print(f'Initializing weights using TT-SVD from: {args.init_model_ttsvd} ... Success')
 
-    optimizer = torch.optim.Adam(
-        params=model.get_param_groups(),
-        lr=args.lrate,
-        betas=(0.9, 0.999),
-    )
+
+    if args.optimizer == "Adam":
+        optimizers = [torch.optim.Adam(
+            params=model.get_param_groups(),
+            lr=args.lrate,
+            betas=(0.9, 0.999),
+        )]
+    elif args.optimizer == "SGD":
+        optimizers = [torch.optim.SGD(
+            params=model.get_param_groups(),
+            lr=args.lrate,
+        )]
+    elif args.optimizer == "SeparatedSGD":
+        optimizers = [
+            torch.optim.SGD(
+                params=[{"params": [param], "tag": group["tag"], "lr": group["lr"]}],
+                lr=args.lrate,
+            )
+            for group in model.get_param_groups()
+            for param in group["params"]
+        ]
+    elif args.optimizer == "LBFGS":
+        optimizers = [torch.optim.LBFGS(
+            params=model.parameters(),
+            lr=args.lrate,
+            line_search_fn = 'strong_wolfe',
+            max_iter=args.lbfgs_iters,
+        )]
+    elif args.optimizer == "SeparatedLBFGS":
+        optimizers = [
+            torch.optim.LBFGS(
+                params=[group],
+                lr=args.lrate,
+                line_search_fn = 'strong_wolfe',
+                max_eval=max(20, args.lbfgs_iters * 1.25),
+                max_iter=args.lbfgs_iters,
+                history_size=1,
+            )
+            for group in model.get_param_groups()
+        ]
+
+
 
     if args.parallel:
         model = torch.nn.DataParallel(model).to(args.device)
@@ -52,6 +93,13 @@ def create_model(args):
         'expand_pdf_value': args.expand_pdf_value,
         'checks': args.checks,
         'use_rgb_sigmoid': args.use_rgb_sigmoid,
+        'lossfn': args.lossfn,
+        'sigma_activation': args.sigma_activation,
+        'alpha': args.alpha,
+        'gamma_a_reg': args.gamma_a_reg,
+        'gamma_b_reg': args.gamma_b_reg,
+        'dist_constant': args.dist_constant,
+        'use_new_march_rays': args.use_new_march_rays,
     }
 
     print('Not ndc!')
@@ -61,18 +109,38 @@ def create_model(args):
     render_kwargs_test['perturb'] = 0
     render_kwargs_test['raw_noise_std'] = 0.
 
-    return model, render_kwargs_train, render_kwargs_test, optimizer
+    return model, render_kwargs_train, render_kwargs_test, optimizers
+
+# def softplus(input):
+#     return np.where
+
+def integrate_exp(exp_sigma, dists):
+    dists = F.pad(dists, (0, 1), mode='constant', value=torch.finfo(dists.dtype).max)  # NR x NS
+    att = exp_sigma.pow(-dists)
+    att_pad_left = F.pad(att[:, :-1], (1, 0), mode='constant', value=1.0)  # NR x NS (add column zeros left, remove column right)
+    # log_att = -sigma * dists  # NR x NS
+    # log_att_pad_left = F.pad(log_att[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
+    # att = log_att.exp()  # NR x NS
+    alpha = 1.0 - att  # NR x NS
+    # cum_log_att_exclusive = torch.cumsum(log_att_pad_left, dim=1)  # NR x NS
+    cum_att_exclusive = torch.cumprod(att_pad_left, dim=1)
+    # cum_att_exclusive = cum_log_att_exclusive.exp()
+    weights = alpha * cum_att_exclusive  # NR x NS
+    return weights
 
 
 def march_rays(
         raw_rgb,
         raw_sigma,
         z_vals,
+        targets,
         raw_noise_std=0.,
         white_bkgd=False,
         ret_weights=False,
         use_new_integration=True,
         use_rgb_sigmoid=None,
+        sigma_activation=None,
+        lossfn=None,
 ):
     assert use_rgb_sigmoid is not None
 
@@ -80,8 +148,7 @@ def march_rays(
 
     if raw_noise_std > 0.:
         raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
-
-    sigma = F.relu(raw_sigma)  # NR x NS
+    
     if use_rgb_sigmoid:
         rgb = torch.sigmoid(raw_rgb)  # NR x NS x 3
     else:
@@ -89,24 +156,158 @@ def march_rays(
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
 
-    integrate_fn = integrate_new if use_new_integration else integrate_old
-    weights = integrate_fn(sigma, dists)  # NR x NS
+    if sigma_activation == 'relu':
+        sigma = F.relu(raw_sigma)  # NR x NS
+        integrate_fn = integrate_new if use_new_integration else integrate_old
+        weights = integrate_fn(sigma, dists)  # NR x NS
+    elif sigma_activation == "logloss":
+        sigma = F.softplus(raw_sigma)
+        integrate_fn = integrate_new if use_new_integration else integrate_old
+        weights = integrate_fn(sigma, dists)  # NR x NS
+        
+
+    weights = torch.cat([weights, 1. - weights.sum(dim=1)[:,None]], dim=1)
 
     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
 
-    if white_bkgd:
-        acc_map = torch.sum(weights, -1)
-        rgb_map = rgb_map + (1. - acc_map[..., None])
-
-    out = {'rgb_map': rgb_map}
+    out = {'rgb_map': rgb_map.detach()}
     if ret_weights:
-        out['weights'] = weights
+        out['weights'] = weights.detach()
+
+    if targets is not None:
+        img_loss = {
+            'huber': F.huber_loss,
+            'mse': F.mse_loss,
+        }[lossfn](rgb_map, targets)
+        out['losses'] = img_loss[None].detach()
+
+        img_loss.backward()
+
+    return out
+
+
+def log_integrate(log_passed, log_not_passed):
+    log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
+    log_alpha = log_not_passed  # NR x NS
+    cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
+    return torch.cat([log_alpha + cum_log_att_exclusive, log_passed.sum(dim=1)[:,None]], dim=1)
+
+
+def march_rays_new(
+        raw_rgb,
+        raw_sigma,
+        raw_var,
+        mask,
+        z_vals,
+        targets,
+        raw_noise_std=0.,
+        white_bkgd=False,
+        ret_weights=False,
+        use_new_integration=True,
+        use_rgb_sigmoid=None,
+        sigma_activation=None,
+        alpha=None,
+        cur_step=None,
+        lossfn=None,
+        gamma_a_reg = None,
+        gamma_b_reg = None,
+):
+    assert use_rgb_sigmoid is not None
+    assert sigma_activation == 'logloss'
+
+    NR, NS = raw_sigma.shape
+
+    # print(raw_sigma.sum(), raw_rgb.sum())
+
+    if raw_noise_std > 0.:
+        raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
+
+    dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
+
+    raw_sigma = torch.where(mask, raw_sigma, torch.full_like(raw_sigma, -float("inf")))
+    mask = F.pad(mask, (0, 1), mode="constant", value=True)
+
+    # sigma = raw_sigma * dists
+    sigma = raw_sigma
+    log_passed = -torch.logaddexp(raw_sigma, torch.zeros_like(raw_sigma))
+    log_not_passed = -torch.logaddexp(-raw_sigma, torch.zeros_like(raw_sigma))
+
+    # print(log_passed.sum(), log_not_passed.sum())
+
+    if use_rgb_sigmoid:
+        rgb = torch.sigmoid(raw_rgb)  # NR x NS x 3
+    else:
+        rgb = raw_rgb
+
+    log_weights = log_integrate(log_passed, log_not_passed)
+    weights = log_weights.exp()
+
+    # print(weights.sum())
+
+    norm_sigma = torch.ones(1, device=raw_sigma.device)
+
+    log_var = raw_var
+    var = raw_var.exp()
+    # print((1 / (2 * var) * torch.sum((rgb - targets[:,None,:]**2), dim=2))[0,:20])
+    # print((1 / (2 * var))[0,:20])
+    # print((torch.sum((rgb - targets[:,None,:])**2, dim=2)).min())
+    # print((torch.sum((rgb - targets[:,None,:])**2, dim=2)).max())
+    # print(log_weights[0,:20])
+
+    # print((log_passed * (~mask[:,:-1])).sum())
+    # print(1.5 + gamma_a_reg - 1)
+    # print((weights.max(dim=1).values < 0.1).sum())
+
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+    out = {
+        'rgb_map': rgb_map.detach(),
+    }
+
+    if targets is not None:
+        log_p = torch.where(
+            mask,
+            -1.5 * math.log(math.pi * 2) + (1.5 + gamma_a_reg - 1) * log_var - var / 2 * (torch.sum((rgb - targets[:,None,:])**2, dim=2) + gamma_b_reg) + log_weights,
+            torch.full_like(raw_var, -float("inf"))
+        )
+        q = torch.softmax(log_p, dim=1).detach()
+        eq = mask / mask.sum(dim=1)[:,None]
+        eps = alpha**cur_step
+        q = eq * eps + q * (1 - eps)
+        # q = q * (1 - eps * mask.sum(dim=1))[:,None] + eps * mask
+        # log_q = F.log_softmax(log_p, dim=1).detach()
+        log_q = torch.log(q)
+        # print((log_weights != float("inf")).sum())
+        # print((q * mask).sum())
+
+        # q = log_p.exp()
+        # q /= q.sum(dim=1)
+        # print(torch.logical_and((q == 0), mask).sum())
+
+        elbo = torch.where(log_p == -float("inf"), torch.zeros_like(q), log_p * q).sum() - torch.where(log_q == -float("inf"), torch.zeros_like(q), log_q * q).sum()
+        out['elbo'] = elbo[None].detach()
+
+        # rgb_map = rgb_map + bkgd_color * (1. - acc_map[..., None])
+
+        if lossfn == "lrf":
+            losses = torch.sum(-torch.where(log_p == -float("inf"), torch.zeros_like(q), log_p * q), dim=1).sum()
+            out['losses'] = losses[None].detach()
+        else:
+            losses = {
+                'huber': F.huber_loss,
+                'mse': F.mse_loss,
+            }[lossfn](rgb_map, targets)
+            out['losses'] = losses[None].detach()
+        losses.backward()
+    if ret_weights:
+        out['weights'] = weights.detach()
+    # print(out['losses'].sum())
 
     return out
 
 
 def render_rays(
         ray_batch,
+        target_batch,
         model,
         N_samples,
         use_viewdirs=False,
@@ -121,6 +322,13 @@ def render_rays(
         cur_step=None,
         checks=True,
         use_rgb_sigmoid=None,
+        lossfn=None,
+        alpha=None,
+        sigma_activation='relu',
+        gamma_a_reg=None,
+        gamma_b_reg=None,
+        dist_constant=False,
+        use_new_march_rays=False,
 ):
     """
     Volumetric rendering.
@@ -150,10 +358,10 @@ def render_rays(
         :param inputs (torch.Tensor): sampled points of shape [batch x ray x 3]
         :param viewdirs (torch.Tensor): directions corresponding to inputs rays of shape [batch x 3]
         """
-        rgb, sigma = model(inputs, viewdirs)
+        rgb, sigma, std, mask = model(inputs, viewdirs)
         if sigma_warmup_sts and cur_step <= sigma_warmup_numsteps:
             sigma *= cur_step / sigma_warmup_numsteps
-        return rgb, sigma
+        return rgb, sigma, std, mask
 
     N_rays, device = ray_batch.shape[0], ray_batch.device
     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]
@@ -162,29 +370,69 @@ def render_rays(
     if use_viewdirs:
         viewdirs = rays_d.clone()
 
-    grid_radius = (dim_grid - 1) * 0.5
-    rays_o.mul_(grid_radius)
-    rays_o.add_(grid_radius)
-
-    t_far = torch.linspace(0., grid_radius, steps=N_samples, device=device)
-    t_near = grid_radius - t_far
-    z_vals = near * t_near + far * t_far
-    z_vals = z_vals.expand([N_rays, N_samples])
-
-    if perturb:
-        # get intervals between samples
+    if dist_constant:
+        z_vals = near + 2 * 3**0.5 / N_samples * torch.arange(N_samples + 1, device=device)
         mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        upper = torch.cat([mids, z_vals[..., -1:]], -1)
-        lower = torch.cat([z_vals[..., :1], mids], -1)
-        # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape, device=device)
-        z_vals = lower + (upper - lower) * t_rand
+        dists = mids[..., 1:] - mids[..., :-1]  # NR x (NS-1)
+        if perturb:
+            upper = z_vals[..., 1:]
+            lower = z_vals[..., :-1]
+            t_rand = torch.rand(mids.shape, device=device)
+            z_vals = lower + (upper - lower) * t_rand
+        else:
+            z_vals = mids
+        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
-    pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    else:
+        t_far = torch.linspace(0., 1.0, steps=N_samples, device=device)
+        t_near = 1.0 - t_far
+        z_vals = near * t_near + far * t_far
+        z_vals = z_vals.expand([N_rays, N_samples])
 
-    raw_rgb, raw_sigma = sample_rays(pts, viewdirs)
+        if perturb:
+            # get intervals between samples
+            mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+            upper = torch.cat([mids, z_vals[..., -1:]], -1)
+            lower = torch.cat([z_vals[..., :1], mids], -1)
+            # stratified samples in those intervals
+            t_rand = torch.rand(z_vals.shape, device=device)
+            z_vals = lower + (upper - lower) * t_rand
 
-    out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=N_importance > 0, use_rgb_sigmoid=use_rgb_sigmoid)
+        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
+
+    raw_rgb, raw_sigma, raw_var, mask = sample_rays(pts, viewdirs)
+
+    # if lossfn == 'lrf':
+    if use_new_march_rays:
+        out = march_rays_new(
+            raw_rgb,
+            raw_sigma,
+            raw_var,
+            mask,
+            z_vals,
+            target_batch,
+            raw_noise_std,
+            white_bkgd,
+            ret_weights=N_importance > 0,
+            cur_step=cur_step,
+            alpha=alpha,
+            lossfn=lossfn,
+            use_rgb_sigmoid=use_rgb_sigmoid,
+            gamma_a_reg=gamma_a_reg,
+            gamma_b_reg=gamma_b_reg,
+            sigma_activation=sigma_activation)
+    else:
+        out = march_rays(
+            raw_rgb,
+            raw_sigma,
+            z_vals,
+            target_batch,
+            raw_noise_std,
+            white_bkgd,
+            lossfn=lossfn,
+            ret_weights=N_importance > 0,
+            use_rgb_sigmoid=use_rgb_sigmoid,
+            sigma_activation=sigma_activation)
 
     if N_importance > 0:
         weights = out['weights']
@@ -214,10 +462,11 @@ def render_rays(
     return out
 
 
-def render_rays_chunks(rays_flat, chunk, **kwargs):
+def render_rays_chunks(rays_flat, chunk, targets, **kwargs):
     all_ret = {}
-    for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i + chunk], **kwargs)
+    for i in trange(0, rays_flat.shape[0], chunk):
+        target_batch = targets[i:i+chunk] if targets is not None else None
+        ret = render_rays(rays_flat[i:i + chunk], target_batch, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -228,7 +477,7 @@ def render_rays_chunks(rays_flat, chunk, **kwargs):
 
 
 def render(
-        H, W, K, chunk, rays=None, c2w=None, ndc=True, near=None, far=None,
+        H, W, K, chunk, rays=None, targets=None, c2w=None, ndc=True, near=None, far=None,
         adjust_near_far=False, filter_rays=False, dir_center_pix=True,
         sigma_warmup_sts=False,
         sigma_warmup_numsteps=None,
@@ -243,6 +492,7 @@ def render(
       K: Tensor. Camera intrinsics matrix
       chunk: int. Maximum number of rays to process simultaneously. Used to control maximum memory usage.
       rays: array of shape [2, batch_size, 3]. Ray origin and direction for each example in batch.
+      targets: TODO,
       c2w: array of shape [3, 4]. Camera-to-world transformation matrix.
       ndc: bool. If True, represent ray origin, direction in NDC coordinates.
       near: float. Nearest distance for a ray.
@@ -253,6 +503,7 @@ def render(
     Returns:
       rgb_map: [batch_size, 3]. Predicted RGB values for rays.
       extras: dict with everything returned by render_rays().
+      loss: loss for batch
     """
     near_vec, far_vec, valid_mask = None, None, None
     if c2w is not None:
@@ -280,7 +531,7 @@ def render(
 
     # Render
     all_ret = render_rays_chunks(
-        rays, chunk,
+        rays, chunk, targets,
         sigma_warmup_sts=sigma_warmup_sts,
         sigma_warmup_numsteps=sigma_warmup_numsteps,
         cur_step=cur_step,
@@ -375,6 +626,8 @@ def config_parser():
                         help='use DataParallel')
 
     # voxel grid configuration
+    parser.add_argument("--models", type=str,
+                        help='models of voxel frid in json')
     parser.add_argument("--model", type=str, default="QTTNF", choices=("QTTNF", "TackerNF", "VMNF", "SkeletonNF"),
                         help='model of voxel frid')
     parser.add_argument("--dim_grid", type=int, default=256,
@@ -385,6 +638,13 @@ def config_parser():
                         help='type of voxel grid compression')
     parser.add_argument("--use_rgb_sigmoid", type=int, default=1,
                         help='use sigmoid on rgb')
+    parser.add_argument("--sigma_activation", type=str, default='relu', choices=('relu', 'logloss'),
+                        help='sigma activation')
+    parser.add_argument("--gamma_a_reg", type=float, default=1.)
+    parser.add_argument("--gamma_b_reg", type=float, default=0.)
+    parser.add_argument("--dist_constant", type=int, default=0)
+    parser.add_argument("--alpha", type=float, default=0.1)
+    parser.add_argument("--use_new_march_rays", type=int, default=0)
     
     # Tacker voxel configuration
     parser.add_argument("--tacker_rank", type=int, default=64,
@@ -440,8 +700,15 @@ def config_parser():
                         help='specific weights npy file to initialize model weights')
     parser.add_argument("--init_model_ttsvd", type=str, default=None,
                         help='weights of a full voxel grid of compatible configuration')
-    parser.add_argument("--lossfn", type=str, default='huber', choices=('mse', 'huber'),
+    parser.add_argument("--lossfn", type=str, default='huber', choices=('mse', 'huber', 'lrf'),
                         help='loss function to use during training')
+    parser.add_argument("--train_size", type=int, default=None,
+                        help='number of rays for train')
+    parser.add_argument("--optimizer", type=str, default="Adam", choices=('Adam', 'SGD', 'SeparatedSGD', 'LBFGS', 'SeparatedLBFGS'),
+                        help='specify optimizer')
+    parser.add_argument("--momentum", type=float, default=0)
+    parser.add_argument("--lbfgs_iters", type=int, default=20,
+                        help='iterations in lbfgs')
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64,
@@ -531,17 +798,17 @@ def train():
     verify_experiment_integrity(args)
 
     # if args.i_wandb:
-    #     wandb.init(
-    #         project='qttnf',
-    #         config=args,
-    #         name=args.expname,
-    #         dir=log_dir,
-    #         force=True,  # makes the user provide wandb online credentials instead of running offline
-    #     )
-    #     wandb.tensorboard.patch(
-    #         save=False,  # copies tb files into cloud and allows to run tensorboard in the cloud
-    #         pytorch=True,
-    #     )
+    wandb.init(
+        project='NeRFwithTensorDecompositions',
+        config=args,
+        name=args.expname,
+        # dir=log_dir,
+        # force=True,  # makes the user provide wandb online credentials instead of running offline
+    )
+        # wandb.tensorboard.patch(
+        #     save=False,  # copies tb files into cloud and allows to run tensorboard in the cloud
+        #     pytorch=True,
+        # )
 
     # Load data
     dataset_path = os.path.join(args.dataset_root, {
@@ -597,7 +864,7 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create model
-    model, render_kwargs_train, render_kwargs_test, optimizer = create_model(args)
+    model, render_kwargs_train, render_kwargs_test, optimizers = create_model(args)
     global_step = 0
 
     bds_dict = {
@@ -673,6 +940,14 @@ def train():
     # Summary writers
     # tb = SilentSummaryWriter(os.path.join(log_dir, 'tb'))
 
+    wandb.log({
+        'num_uncompressed_params': model.num_uncompressed_params,
+        'num_compressed_params': model.num_compressed_params,
+        # 'sz_uncompressed_gb': model.sz_uncompressed_gb,
+        # 'sz_compressed_gb': model.sz_compressed_gb,
+        # 'compression_factor': model.compression_factor,
+    }, step=0)
+
     # tb_add_scalars(tb, 'stats', {
     #     'num_uncompressed_params': model.module.num_uncompressed_params,
     #     'num_compressed_params': model.module.num_compressed_params,
@@ -681,10 +956,17 @@ def train():
     #     'compression_factor': model.module.compression_factor,
     # }, global_step=0)
 
-    id_sampler = iter(ScramblingSampler(ds_target.shape[0], args.N_rand))
-
+    if args.train_size is not None:
+        id_sampler = iter(ScramblingSampler(
+            np.random.permutation(ds_target.shape[0])[:args.train_size],
+            args.N_rand))
+    else:
+        id_sampler = iter(ScramblingSampler(ds_target.shape[0], args.N_rand))
+    
     model.train()
-    for i in trange(0, args.N_iters + 1, disable=not args.i_tqdm):
+    j = 0
+    print(len(optimizers))
+    for i, optimizer in zip(trange(0, args.N_iters + 1, disable=not args.i_tqdm), cycle(optimizers)):
         ids = next(id_sampler)
         rays_o = ds_rays_o[ids].to(args.device)
         rays_d = ds_rays_d[ids].to(args.device)
@@ -696,53 +978,71 @@ def train():
         else:
             batch_rays = [rays_o, rays_d]
 
-        out = render(
-            H, W, K,
-            chunk=args.chunk,
-            rays=batch_rays,
-            sigma_warmup_sts=args.sigma_warmup_sts,
-            sigma_warmup_numsteps=args.sigma_warmup_numsteps,
-            cur_step=i,
-            **render_kwargs_train
-        )
+        mse_loss = None
+        loss = None
 
-        optimizer.zero_grad()
+        def closure():
+            nonlocal j
+            j += 1
 
-        img_loss = {
-            'huber': F.huber_loss,
-            'mse': F.mse_loss,
-        }[args.lossfn](out['rgb_map'], target)
+            optimizer.zero_grad()
 
-        loss = img_loss
+            out = render(
+                H, W, K,
+                chunk=args.chunk,
+                rays=batch_rays,
+                targets=target,
+                sigma_warmup_sts=args.sigma_warmup_sts,
+                sigma_warmup_numsteps=args.sigma_warmup_numsteps,
+                cur_step=j,
+                **render_kwargs_train
+            )
 
-        if args.N_importance > 0:
-            img_loss0 = img2mse(out['rgb_map0'], target)
-            loss = loss + img_loss0
+            nonlocal mse_loss
+            nonlocal loss
+            mse_loss = F.mse_loss(out['rgb_map'], target).detach().cpu()
+            loss = out['losses'].mean().detach().cpu()
+            
 
-        loss.backward()
-        optimizer.step()
+            if j % args.i_print == 0:
+                psnr = mse2psnr(mse_loss)
+                val = {
+                    "iter": j,
+                    "loss": loss.item(),
+                    "mse_loss": mse_loss.item(),
+                    "psrn": psnr.item(),
+                }
+                if "elbo" in out:
+                    print("ELBO: ", out['elbo'].sum(), i)
+                    val["elbo"] = out['elbo'].sum()
+                msg = f"[TRAIN] Iter: {j} of {args.N_iters}, loss: {loss.item()}"
+                msg += f', PSNR: {psnr.item()}'
+                wandb.log(val, step=j)
+                print(msg)
 
-        decay_rate = 0.1
-        new_lrate = args.lrate * (decay_rate ** (global_step / args.lrate_decay))
-        if args.lrate_warmup_steps > 0 and global_step < args.lrate_warmup_steps:
-            new_lrate *= global_step / args.lrate_warmup_steps
-        for param_group in optimizer.param_groups:
-            if param_group['tag'] == 'vox':
-                param_group['lr'] = new_lrate
+
+            # if args.N_importance > 0:
+            #     img_loss0 = img2mse(out['rgb_map0'], target)
+            #     loss = loss + img_loss0
+
+            return loss
+
+        if args.optimizer in {"LBFGS", "SeparatedLBFGS"}:
+            optimizer.step(closure)
+        else:
+            closure()
+            optimizer.step()
+        
+        if args.optimizer != "LBFGS" and args.optimizer != "SeparatedLBFGS":
+            decay_rate = 0.1
+            new_lrate = args.lrate * (decay_rate ** (global_step / args.lrate_decay))
+            if args.lrate_warmup_steps > 0 and global_step < args.lrate_warmup_steps:
+                new_lrate *= global_step / args.lrate_warmup_steps
+            for param_group in optimizer.param_groups:
+                if param_group['tag'] == 'vox':
+                    param_group['lr'] = new_lrate
 
         # Rest is logging
-        if i % args.i_print == 0:
-            vals = {
-                'loss': loss,
-                'LR': new_lrate,
-            }
-            msg = f"[TRAIN] Iter: {i} of {args.N_iters}, loss: {loss.item()}"
-            if args.lossfn == 'mse':
-                psnr = mse2psnr(img_loss)
-                vals['psnr'] = psnr
-                msg += f', PSNR: {psnr.item()}'
-            tqdm.write(msg)
-            # tb_add_scalars(tb, 'train', vals, global_step=i)
 
         # if i % args.i_img == 0 and i > 0:
         #     for oid in args.i_img_ids:
@@ -784,6 +1084,13 @@ def train():
             )
             model.train()
 
+            wandb.log({
+                'test_mse': test_mse,
+                'test_psnr': test_psnr,
+                'test_ssim': test_ssim,
+                'test_lpips': test_lpips,
+            }, step=j)
+
             # tb_add_scalars(tb, 'test', {
             #     'mse': test_mse,
             #     'psnr': test_psnr,
@@ -798,6 +1105,9 @@ def train():
     path = os.path.join(log_dir, 'final.pth')
     torch.save(render_kwargs_train['model'].state_dict(), path)
     tqdm.write(f'Saved model: {path}')
+    wandb.save(base_path=log_dir, glob_str="./*/*")
+    wandb.save(base_path=log_dir, glob_str="./*")
+    wandb.finish()
 
 
 if __name__ == '__main__':

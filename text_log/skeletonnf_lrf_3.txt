@@ -1,20 +1,19 @@
-Loaded blender (138, 800, 800, 4) torch.Size([40, 4, 4]) [800, 800, 1111.1110311937682] data/nerf_synthetic/lego
-Std tensor(0.4368)
+Loaded blender (138, 100, 100, 4) torch.Size([40, 4, 4]) [100, 100, 138.88887889922103] data/nerf_synthetic/lego
 RadianceField(
   (shader): ShaderSphericalHarmonics()
-  (vox_fused): VMNF(
+  (vox_rgb): SkeletonNF(
     (vectors): ParameterList(
-        (0): Parameter containing: [torch.FloatTensor of size 48x256]
-        (1): Parameter containing: [torch.FloatTensor of size 48x256]
-        (2): Parameter containing: [torch.FloatTensor of size 48x256]
+        (0): Parameter containing: [torch.FloatTensor of size 128x16x27]
+        (1): Parameter containing: [torch.FloatTensor of size 128x16x27]
+        (2): Parameter containing: [torch.FloatTensor of size 128x16x27]
     )
     (matrices): ParameterList(
-        (0): Parameter containing: [torch.FloatTensor of size 48x256x256]
-        (1): Parameter containing: [torch.FloatTensor of size 48x256x256]
-        (2): Parameter containing: [torch.FloatTensor of size 48x256x256]
+        (0): Parameter containing: [torch.FloatTensor of size 16x128x128]
+        (1): Parameter containing: [torch.FloatTensor of size 16x128x128]
+        (2): Parameter containing: [torch.FloatTensor of size 16x128x128]
     )
-    (B): Linear(in_features=144, out_features=28, bias=False)
   )
+  (vox_sigma): FullNF()
 )
 Not ndc!
 Begin

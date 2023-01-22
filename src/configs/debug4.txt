@@ -1,0 +1,42 @@
+expname = debug4
+dataset_dir = lego
+dataset_type = blender
+dataset_root = data
+log_root = log
+
+white_bkgd = True
+device=cuda:2
+
+lrate = 1e-3
+lrate_decay = 80000
+lrate_warmup_steps = 0
+N_samples = 128
+N_importance = 0
+N_rand = 4096
+N_iters = 40000
+i_img = 2000
+i_img_ids = [1]
+i_testset = 5000
+i_video = 100000
+i_print=10
+i_wandb=0
+
+lossfn = lrf
+
+image_downscale_factor = 8
+image_downscale_filter = antialias
+scene_scale = 0.8
+
+dim_grid = 128
+
+models = '{"rgb": {"model": "FullNF","init_method": "normal", "return_mask": 1, "outliers_handling": "zeros"}, "sigma": {"model": "FullNF", "init_method": "constant", "constant": -4.1, "outliers_handling": "inf"}, "var": {"model": "FullNF", "init_method": "constant", "constant": 0.0, "outliers_handling": "inf"}}'
+optimizer=SGD
+momentum=0.9
+alpha=0.9995
+sigma_warmup_sts=0
+perturb=0
+use_rgb_sigmoid=0
+sigma_activation=logloss
+dtype = float32
+checks = 0
+dist_constant = 1
