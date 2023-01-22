@@ -1,0 +1,73 @@
+Loaded blender (138, 100, 100, 4) torch.Size([40, 4, 4]) [100, 100, 138.88887889922103] data/nerf_synthetic/lego
+RadianceField(
+  (shader): ShaderSphericalHarmonics()
+  (vox_rgb): SkeletonNF(
+    (vectors): ParameterList(
+        (0): Parameter containing: [torch.FloatTensor of size 128x16x27]
+        (1): Parameter containing: [torch.FloatTensor of size 128x16x27]
+        (2): Parameter containing: [torch.FloatTensor of size 128x16x27]
+    )
+    (matrices): ParameterList(
+        (0): Parameter containing: [torch.FloatTensor of size 16x128x128]
+        (1): Parameter containing: [torch.FloatTensor of size 16x128x128]
+        (2): Parameter containing: [torch.FloatTensor of size 16x128x128]
+    )
+  )
+  (vox_sigma): FullNF()
+  (vox_var): FullNF()
+)
+Not ndc!
+Begin
+TRAIN views are [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+ 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
+ 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71
+ 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95
+ 96 97 98 99]
+TEST views are [113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 129 130
+ 131 132 133 134 135 136 137]
+VAL views are [100 101 102 103 104 105 106 107 108 109 110 111 112]
+1
+ELBO:  tensor(-2265853.5000, device='cuda:2') 0
+[TRAIN] Iter: 1 of 40000, loss: 57056.1328125, PSNR: 6.191185474395752
+ELBO:  tensor(-2255102.5000, device='cuda:2') 1
+[TRAIN] Iter: 2 of 40000, loss: 57142.03125, PSNR: 6.2217116355896
+ELBO:  tensor(-2246001.2500, device='cuda:2') 2
+[TRAIN] Iter: 3 of 40000, loss: 57204.17578125, PSNR: 6.255361080169678
+ELBO:  tensor(-2237843.5000, device='cuda:2') 3
+[TRAIN] Iter: 4 of 40000, loss: 57262.890625, PSNR: 6.302090644836426
+ELBO:  tensor(-2229690.7500, device='cuda:2') 4
+[TRAIN] Iter: 5 of 40000, loss: 57348.2109375, PSNR: 6.380096912384033
+ELBO:  tensor(-2220067.7500, device='cuda:2') 5
+[TRAIN] Iter: 6 of 40000, loss: 57514.64453125, PSNR: 6.527327060699463
+ELBO:  tensor(-2206675.7500, device='cuda:2') 6
+[TRAIN] Iter: 7 of 40000, loss: 57861.84765625, PSNR: 6.819565296173096
+ELBO:  tensor(-2187102.5000, device='cuda:2') 7
+[TRAIN] Iter: 8 of 40000, loss: 58536.6953125, PSNR: 7.382663249969482
+ELBO:  tensor(-2162349.2500, device='cuda:2') 8
+[TRAIN] Iter: 9 of 40000, loss: 59618.84765625, PSNR: 8.325069427490234
+ELBO:  tensor(-2138607.5000, device='cuda:2') 9
+[TRAIN] Iter: 10 of 40000, loss: 60864.01171875, PSNR: 9.509994506835938
+ELBO:  tensor(-2118907.5000, device='cuda:2') 10
+[TRAIN] Iter: 11 of 40000, loss: 61847.72265625, PSNR: 10.594091415405273
+ELBO:  tensor(-2103000.5000, device='cuda:2') 11
+[TRAIN] Iter: 12 of 40000, loss: 62529.69140625, PSNR: 11.465950965881348
+ELBO:  tensor(-2090555.8750, device='cuda:2') 12
+[TRAIN] Iter: 13 of 40000, loss: 63028.02734375, PSNR: 12.12264347076416
+ELBO:  tensor(-2080708.2500, device='cuda:2') 13
+[TRAIN] Iter: 14 of 40000, loss: 63344.9296875, PSNR: 12.559864044189453
+ELBO:  tensor(-2072700., device='cuda:2') 14
+[TRAIN] Iter: 15 of 40000, loss: 63576.75390625, PSNR: 12.856694221496582
+ELBO:  tensor(-2065985.5000, device='cuda:2') 15
+[TRAIN] Iter: 16 of 40000, loss: 63719.0078125, PSNR: 13.056717872619629
+ELBO:  tensor(-2060197.3750, device='cuda:2') 16
+[TRAIN] Iter: 17 of 40000, loss: 63852.23828125, PSNR: 13.20158576965332
+ELBO:  tensor(-2055089.5000, device='cuda:2') 17
+[TRAIN] Iter: 18 of 40000, loss: 63904.66796875, PSNR: 13.312374114990234
+ELBO:  tensor(-2050524.5000, device='cuda:2') 18
+[TRAIN] Iter: 19 of 40000, loss: 64024.62109375, PSNR: 13.385566711425781
+ELBO:  tensor(-2046470.2500, device='cuda:2') 19
+[TRAIN] Iter: 20 of 40000, loss: 63966.7265625, PSNR: 13.469635963439941
+ELBO:  tensor(-2043243.1250, device='cuda:2') 20
+[TRAIN] Iter: 21 of 40000, loss: 64198.09375, PSNR: 13.42673397064209
+ELBO:  tensor(-2042650.7500, device='cuda:2') 21
+[TRAIN] Iter: 22 of 40000, loss: 63756.4375, PSNR: 13.421211242675781

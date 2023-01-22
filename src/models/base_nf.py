@@ -55,7 +55,7 @@ class BaseNF(nn.Module):
         self.dim = 3
         self.dtype_sz_bytes = 4
         self.outliers_handling = outliers_handling
-        assert self.outliers_handling == "zeros", f"Unsupported outliers_handling {self.outliers_handling}"
+        assert self.outliers_handling in {"zeros", "inf"}, f"Unsupported outliers_handling {self.outliers_handling}"
 
         # factory_kwargs = {"device": device, "dtype": dtype}
         super(BaseNF, self).__init__()
@@ -122,23 +122,27 @@ class BaseNF(nn.Module):
         :return:
         """
 
+        fill_value = {
+            "zeros": 0,
+            "inf": -float("inf"),
+        }[self.outliers_handling]
+
         batch_size, _ = coords_xyz.shape
         mask_valid = torch.all(coords_xyz >= 0, dim=1) & torch.all(coords_xyz <= self.dim_grid - 1, dim=1)
-        if self.outliers_handling == 'zeros':
-            coords_xyz = coords_xyz[mask_valid]
-            if coords_xyz.shape[0] == 0:
-                if self.return_mask:
-                    return torch.zeros(batch_size, self.output_features, dtype=coords_xyz.dtype, device=coords_xyz.device), mask_valid
-                else:
-                    return torch.zeros(batch_size, self.output_features, dtype=coords_xyz.dtype, device=coords_xyz.device)
-            mask_need_remap = coords_xyz.shape[0] < batch_size
+        coords_xyz = coords_xyz[mask_valid]
+        if coords_xyz.shape[0] == 0:
+            if self.return_mask:
+                return torch.full((batch_size, self.output_features), fill_value, dtype=coords_xyz.dtype, device=coords_xyz.device), mask_valid
+            else:
+                return torch.full((batch_size, self.output_features), fill_value, dtype=coords_xyz.dtype, device=coords_xyz.device)
+        mask_need_remap = coords_xyz.shape[0] < batch_size
         
 
         result = self.sample_tensor_points(coords_xyz)
 
         
-        if self.outliers_handling == 'zeros' and mask_need_remap:
-            out_sparse = torch.zeros(batch_size, self.output_features, dtype=coords_xyz.dtype, device=coords_xyz.device)
+        if mask_need_remap:
+            out_sparse = torch.full((batch_size, self.output_features), fill_value, dtype=coords_xyz.dtype, device=coords_xyz.device)
             out_sparse[mask_valid] = result
             if self.return_mask:
                 return out_sparse, mask_valid

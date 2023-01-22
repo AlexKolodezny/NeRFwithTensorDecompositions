@@ -46,3 +46,10 @@ class FullNF(BaseNF):
         
         result = F.grid_sample(self.tensor, coords_xyz[None,:,None,None,:].detach(), align_corners=True).squeeze(4).squeeze(3).squeeze(0).T
         return result
+
+    def get_param_groups(self):
+        out = []
+        out += [
+            {'params': self.tensor}
+        ]
+        return out

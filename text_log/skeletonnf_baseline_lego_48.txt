@@ -1,17 +1,28 @@
 Loaded blender (138, 800, 800, 4) torch.Size([40, 4, 4]) [800, 800, 1111.1110311937682] data/nerf_synthetic/lego
-Std tensor(0.4518)
 RadianceField(
   (shader): ShaderSphericalHarmonics()
-  (vox_fused): SkeletonNF(
+  (vox_rgb): SkeletonNF(
     (vectors): ParameterList(
-        (0): Parameter containing: [torch.FloatTensor of size 256x8x28]
-        (1): Parameter containing: [torch.FloatTensor of size 256x8x28]
-        (2): Parameter containing: [torch.FloatTensor of size 256x8x28]
+        (0): Parameter containing: [torch.FloatTensor of size 256x48x27]
+        (1): Parameter containing: [torch.FloatTensor of size 256x48x27]
+        (2): Parameter containing: [torch.FloatTensor of size 256x48x27]
     )
     (matrices): ParameterList(
-        (0): Parameter containing: [torch.FloatTensor of size 256x256x8]
-        (1): Parameter containing: [torch.FloatTensor of size 256x256x8]
-        (2): Parameter containing: [torch.FloatTensor of size 256x256x8]
+        (0): Parameter containing: [torch.FloatTensor of size 48x256x256]
+        (1): Parameter containing: [torch.FloatTensor of size 48x256x256]
+        (2): Parameter containing: [torch.FloatTensor of size 48x256x256]
+    )
+  )
+  (vox_sigma): SkeletonNF(
+    (vectors): ParameterList(
+        (0): Parameter containing: [torch.FloatTensor of size 256x48x1]
+        (1): Parameter containing: [torch.FloatTensor of size 256x48x1]
+        (2): Parameter containing: [torch.FloatTensor of size 256x48x1]
+    )
+    (matrices): ParameterList(
+        (0): Parameter containing: [torch.FloatTensor of size 48x256x256]
+        (1): Parameter containing: [torch.FloatTensor of size 48x256x256]
+        (2): Parameter containing: [torch.FloatTensor of size 48x256x256]
     )
   )
 )
@@ -25,3 +36,8 @@ TRAIN views are [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 
 TEST views are [113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 129 130
  131 132 133 134 135 136 137]
 VAL views are [100 101 102 103 104 105 106 107 108 109 110 111 112]
+[TRAIN] Iter: 0 of 20000, loss: 0.08309731632471085, PSNR: 10.804130554199219
+[TRAIN] Iter: 10 of 20000, loss: 0.08018001168966293, PSNR: 10.959339141845703
+[TRAIN] Iter: 20 of 20000, loss: 0.07384451478719711, PSNR: 11.316816329956055
+[TRAIN] Iter: 30 of 20000, loss: 0.06872894614934921, PSNR: 11.628602981567383
+[TRAIN] Iter: 40 of 20000, loss: 0.05821157991886139, PSNR: 12.349905967712402

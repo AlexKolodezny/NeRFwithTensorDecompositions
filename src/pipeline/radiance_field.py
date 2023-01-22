@@ -129,6 +129,8 @@ class RadianceField(torch.nn.Module):
         super().__init__()
         self.args = args
 
+        self.dtype_sz_bytes = 4
+
         if args.shading_mode == 'spherical_harmonics':
             self.shader = ShaderSphericalHarmonics(args.sh_basis_dim, checks=args.checks)
         elif args.shading_mode == 'mlp':
@@ -204,7 +206,6 @@ class RadianceField(torch.nn.Module):
         def create_model_kwargs(model_config):
             config = deepcopy(model_config)
             del config["model"]
-            config["outliers_handling"] ='zeros'
             return config
 
         if "sigma" in models_config:
@@ -265,6 +266,18 @@ class RadianceField(torch.nn.Module):
         return rgb, sigma, var, mask
 
     def get_param_groups(self):
+        if self.args.optimizer == "SeparatedLBFGS":
+            out = []
+            if "var" in self.models_config:
+                out += self.vox_var.get_param_groups()
+            out += self.vox_rgb.get_param_groups()
+            if "sigma" in self.models_config:
+                out += self.vox_sigma.get_param_groups()
+            if self.args.shading_mode == "mlp":
+                out += [
+                    {'tag': 'shader', 'params': self.shader.parameters(), 'lr': self.args.lrate_shader},
+                ]
+            return out
         out = []
         # if self.args.models is not None:
         out += [
@@ -298,33 +311,29 @@ class RadianceField(torch.nn.Module):
 
     @property
     def num_uncompressed_params(self):
-        if self.args.grid_type == 'fused':
-            return self.vox_fused.num_uncompressed_params
-        elif self.args.grid_type == 'separate':
-            return self.vox_rgb.num_uncompressed_params + self.vox_sigma.num_uncompressed_params
+        return sum([model.num_uncompressed_params for model in [self.vox_rgb] + \
+            ([self.vox_sigma] if "sigma" in self.models_config else []) + \
+            ([self.vox_var] if "var" in self.models_config else [])])
 
     @property
     def num_compressed_params(self):
-        out = self.shader_num_params
-        if self.args.grid_type == 'fused':
-            out += self.vox_fused.num_compressed_params
-        elif self.args.grid_type == 'separate':
-            out += self.vox_rgb.num_compressed_params + self.vox_sigma.num_compressed_params
-        return out
+        return sum([model.num_compressed_params for model in [self.vox_rgb] + \
+            ([self.vox_sigma] if "sigma" in self.models_config else []) + \
+            ([self.vox_var] if "var" in self.models_config else [])]) + \
+            self.shader_num_params
 
     @property
     def sz_uncompressed_gb(self):
-        if self.args.grid_type == 'fused':
-            return self.vox_fused.sz_uncompressed_gb
-        elif self.args.grid_type == 'separate':
-            return self.vox_rgb.sz_uncompressed_gb + self.vox_sigma.sz_uncompressed_gb
+        return sum([model.sz_uncompressed_gb for model in [self.vox_rgb] + \
+            ([self.vox_sigma] if "sigma" in self.models_config else []) + \
+            ([self.vox_var] if "var" in self.models_config else [])]) 
 
     @property
     def sz_compressed_gb(self):
-        if self.args.grid_type == 'fused':
-            return self.vox_fused.sz_compressed_gb
-        elif self.args.grid_type == 'separate':
-            return self.vox_rgb.sz_compressed_gb + self.vox_sigma.sz_compressed_gb
+        return sum([model.sz_compressed_gb for model in [self.vox_rgb] + \
+            ([self.vox_sigma] if "sigma" in self.models_config else []) + \
+            ([self.vox_var] if "var" in self.models_config else [])]) + \
+            self.shader_num_params * self.dtype_sz_bytes / (1024**3)
 
     @property
     def compression_factor(self):

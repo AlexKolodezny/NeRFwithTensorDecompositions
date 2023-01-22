@@ -1,16 +1,16 @@
-expname = skeletonnf_baseline_lego_96
+expname = skeletonnf_lrf_4
 dataset_dir = lego
 dataset_type = blender
 dataset_root = data
 log_root = log
 
-white_bkgd = True
+device = cuda:2
 
-device=cuda:1
+white_bkgd = True
 
 lrate = 3e-3
 lrate_decay = 40000
-lrate_warmup_steps = 0
+lrate_warmup_steps = 1000
 N_samples = 512
 N_importance = 0
 N_rand = 4096
@@ -18,7 +18,7 @@ N_iters = 80000
 i_img = 2000
 i_img_ids = [1]
 i_testset = 20000
-i_video = 100000
+i_video = 80000
 i_print=10
 i_wandb=0
 
@@ -30,7 +30,12 @@ scene_scale = 0.8
 
 dim_grid = 256
 
-models = '{"rgb": {"model": "SkeletonNF","skeleton_rank": 96, "return_mask": 1}}'
+models = '{"rgb": {"model": "SkeletonNF","skeleton_rank": 96, "return_mask": 1}, "sigma": {"model": "FullNF", "init_method": "constant", "constant": -10.15}}'
+
+optimizer=Adam
+use_rgb_sigmoid = 0
+perturb=0
 sigma_warmup_sts=0
-dtype = float32
-checks = 0
+sigma_activation=logloss
+gamma_a_reg=1.
+gamma_b_reg=0.001
