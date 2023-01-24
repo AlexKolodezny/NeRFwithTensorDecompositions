@@ -1,0 +1,38 @@
+expname = ttnf_split_48_mse_lego
+dataset_dir = lego
+dataset_type = blender
+dataset_root = data
+log_root = log
+
+white_bkgd = True
+
+device=cuda:2
+
+lrate = 3e-3
+lrate_decay = 80000
+lrate_warmup_steps = 0
+N_samples = 512
+N_importance = 0
+N_rand = 4096
+N_iters = 40000
+i_img = 2000
+i_img_ids = [1]
+i_testset = 20000
+i_video = 100000
+i_print=100
+i_wandb=0
+
+lossfn = mse
+
+image_downscale_factor = 1
+image_downscale_filter = antialias
+scene_scale = 0.8
+
+dim_grid = 256
+
+models = '{"rgb": {"model": "TTNF","dim_modes": [16,16], "tt_rank_max": 48, "return_mask": 1}, "sigma": {"model": "TTNF","dim_modes": [16,16], "tt_rank_max": 48, "outliers_handling": "inf"}}'
+sigma_warmup_sts=0
+use_rgb_sigmoid=0
+dtype = float32
+checks = 0
+

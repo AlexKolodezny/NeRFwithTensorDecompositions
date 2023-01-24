@@ -11,12 +11,13 @@ from ..models.tacker import TackerNF
 from ..models.vm import VMNF
 from ..models.skeleton import SkeletonNF
 from ..models.full import FullNF
+from ..models.ttnf2 import TTNF
 
 from ..models.spherical_harmonics import spherical_harmonics_bases
 
 model_dict = {
     "QTTNF": QTTNF,
-    "TTNF": QTTNF,
+    "TTNF": TTNF,
     "TackerNF": TackerNF,
     "VNMF": VMNF,
     "SkeletonNF": SkeletonNF,

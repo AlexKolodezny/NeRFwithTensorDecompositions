@@ -579,7 +579,12 @@ def sample_intcoord_tt_v3(input, coords, tt_core_isparam=None, last_core_is_payl
         elif tt_core_isparam[ci]:
             # middle
             if bv is None:
-                bv = input[ci][indices_left, core_ind.long(), :]
+                if indices_left is None:
+                    bv = input[ci].squeeze(0)[core_ind.long(), :]
+                else:
+                    print(ci)
+                    print(indices_left.max(), indices_left.min())
+                    bv = input[ci][indices_left, core_ind.long(), :]
             else:
                 mm = input[ci].permute(1, 0, 2)  # m x r_l x r_r
                 if permutation_fwd is not None:

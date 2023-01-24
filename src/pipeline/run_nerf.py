@@ -155,6 +155,7 @@ def march_rays(
         rgb = raw_rgb
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
+    # dists *= z_vals.shape[-1] / 2
 
     if sigma_activation == 'relu':
         sigma = F.relu(raw_sigma)  # NR x NS
