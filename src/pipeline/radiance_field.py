@@ -11,6 +11,9 @@ from ..models.tacker import TackerNF
 from ..models.vm import VMNF
 from ..models.skeleton import SkeletonNF
 from ..models.full import FullNF
+from ..models.full import FullNFForRGB
+from ..models.full import FullNFForSigma
+from ..models.full import FullNFForVar
 from ..models.ttnf2 import TTNF
 
 from ..models.spherical_harmonics import spherical_harmonics_bases
@@ -22,6 +25,9 @@ model_dict = {
     "VNMF": VMNF,
     "SkeletonNF": SkeletonNF,
     "FullNF": FullNF,
+    "FullNFForRGB": FullNFForRGB,
+    "FullNFForSigma": FullNFForSigma,
+    "FullNFForVar": FullNFForVar,
 }
 
 class ShaderBase(torch.nn.Module):
@@ -228,7 +234,7 @@ class RadianceField(torch.nn.Module):
             )
         self.bkgd_rgb = 1. if args.white_bkgd else 0.
         self.bkgd_var = torch.nn.Parameter(torch.tensor(1.))
-
+    
 
     def forward(self, coords_xyz, viewdirs):
         if self.args.checks:
@@ -247,6 +253,8 @@ class RadianceField(torch.nn.Module):
 
         rgb, sigma = rgb.view(B, R, -1), sigma.view(B, R)
         rgb = self.shader(coords_xyz, viewdirs, rgb)
+        if self.args.use_rgb_sigmoid:
+            rgb = torch.sigmoid(rgb)  # NR x NS x 3
         rgb = F.pad(rgb, (0, 0, 0, 1), mode="constant", value=self.bkgd_rgb)
         mask = mask.view(B, R)
 
@@ -339,3 +347,24 @@ class RadianceField(torch.nn.Module):
     @property
     def compression_factor(self):
         return self.num_uncompressed_params / self.num_compressed_params
+
+    def get_intersect_coords(self, rays_o, rays_d):
+        eps = self.args.intersect_threshold
+        eps *= 2 / self.args.dim_grid
+        invdirs = torch.reciprocal(rays_d)
+
+        lb = torch.tensor([-1.] * 3, device=rays_d.device)
+        rt = torch.tensor([1.] * 3, device=rays_d.device)
+        t1 = (lb - rays_o) * invdirs
+        t2 = (rt - rays_o) * invdirs
+        near = torch.max(torch.min(t1, t2), dim=-1).values
+        far = torch.min(torch.max(t1, t2), dim=-1).values
+
+        borders = torch.linspace(-1, 1, self.args.dim_grid + 1, device=rays_o.device)[None,:].expand(3, self.args.dim_grid + 1)
+        t, indices = ((borders[None,:,:] - rays_o[:,:,None]) * invdirs[:,:,None]).view(-1, 3 * (self.args.dim_grid + 1)).sort(dim=1)
+        z = 0.5 * (t[:,1:] + t[:,:-1])
+        dists = t[:, 1:] - t[:,:-1]
+        mask = (z <= far[:,None]) & (z >= near[:,None]) & (dists >= eps) & (z >= 0)
+        
+        return z, dists, mask
+

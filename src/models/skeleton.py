@@ -69,6 +69,12 @@ class SkeletonNF(BaseNF):
         ]
 
         return sum(results)
+    
+    def contract(self):
+        return \
+            torch.einsum("irc,rjk->cijk", self.vectors[0], self.matrices[0]) + \
+            torch.einsum("jrc,rik->cijk", self.vectors[1], self.matrices[1]) + \
+            torch.einsum("krc,rij->cijk", self.vectors[2], self.matrices[2])
 
     def get_param_groups(self):
         out = []

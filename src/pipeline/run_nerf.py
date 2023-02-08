@@ -11,6 +11,7 @@ import wandb
 from .helpers import *
 from .load_blender import load_blender_data
 from .radiance_field import RadianceField
+from ..models.spherical_harmonics import spherical_harmonics_bases
 
 # device = "cuda" if torch.cuda.is_available() else "cpu"
 # device = "cpu"
@@ -92,14 +93,13 @@ def create_model(args):
         'raw_noise_std': args.raw_noise_std,
         'expand_pdf_value': args.expand_pdf_value,
         'checks': args.checks,
-        'use_rgb_sigmoid': args.use_rgb_sigmoid,
         'lossfn': args.lossfn,
         'sigma_activation': args.sigma_activation,
         'alpha': args.alpha,
-        'gamma_a_reg': args.gamma_a_reg,
-        'gamma_b_reg': args.gamma_b_reg,
         'dist_constant': args.dist_constant,
         'use_new_march_rays': args.use_new_march_rays,
+        'sample_points': args.sample_points,
+        'use_EM': args.use_EM,
     }
 
     print('Not ndc!')
@@ -138,24 +138,15 @@ def march_rays(
         white_bkgd=False,
         ret_weights=False,
         use_new_integration=True,
-        use_rgb_sigmoid=None,
         sigma_activation=None,
         lossfn=None,
 ):
-    assert use_rgb_sigmoid is not None
-
     NR, NS = raw_sigma.shape
 
     if raw_noise_std > 0.:
         raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
-    
-    if use_rgb_sigmoid:
-        rgb = torch.sigmoid(raw_rgb)  # NR x NS x 3
-    else:
-        rgb = raw_rgb
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
-    # dists *= z_vals.shape[-1] / 2
 
     if sigma_activation == 'relu':
         sigma = F.relu(raw_sigma)  # NR x NS
@@ -167,9 +158,13 @@ def march_rays(
         weights = integrate_fn(sigma, dists)  # NR x NS
         
 
+    # print(weights.sum(dim=1).mean())
+
     weights = torch.cat([weights, 1. - weights.sum(dim=1)[:,None]], dim=1)
 
-    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+    rgb_map = torch.sum(weights[..., None] * raw_rgb, -2)  # [N_rays, 3]
+
+    # print(rgb_map.mean())
 
     out = {'rgb_map': rgb_map.detach()}
     if ret_weights:
@@ -205,59 +200,28 @@ def march_rays_new(
         white_bkgd=False,
         ret_weights=False,
         use_new_integration=True,
-        use_rgb_sigmoid=None,
         sigma_activation=None,
         alpha=None,
         cur_step=None,
         lossfn=None,
-        gamma_a_reg = None,
-        gamma_b_reg = None,
 ):
-    assert use_rgb_sigmoid is not None
     assert sigma_activation == 'logloss'
 
     NR, NS = raw_sigma.shape
 
-    # print(raw_sigma.sum(), raw_rgb.sum())
-
     if raw_noise_std > 0.:
         raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
 
-    dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
-
+    rgb = raw_rgb
     raw_sigma = torch.where(mask, raw_sigma, torch.full_like(raw_sigma, -float("inf")))
     mask = F.pad(mask, (0, 1), mode="constant", value=True)
 
-    # sigma = raw_sigma * dists
     sigma = raw_sigma
     log_passed = -torch.logaddexp(raw_sigma, torch.zeros_like(raw_sigma))
     log_not_passed = -torch.logaddexp(-raw_sigma, torch.zeros_like(raw_sigma))
 
-    # print(log_passed.sum(), log_not_passed.sum())
-
-    if use_rgb_sigmoid:
-        rgb = torch.sigmoid(raw_rgb)  # NR x NS x 3
-    else:
-        rgb = raw_rgb
-
     log_weights = log_integrate(log_passed, log_not_passed)
     weights = log_weights.exp()
-
-    # print(weights.sum())
-
-    norm_sigma = torch.ones(1, device=raw_sigma.device)
-
-    log_var = raw_var
-    var = raw_var.exp()
-    # print((1 / (2 * var) * torch.sum((rgb - targets[:,None,:]**2), dim=2))[0,:20])
-    # print((1 / (2 * var))[0,:20])
-    # print((torch.sum((rgb - targets[:,None,:])**2, dim=2)).min())
-    # print((torch.sum((rgb - targets[:,None,:])**2, dim=2)).max())
-    # print(log_weights[0,:20])
-
-    # print((log_passed * (~mask[:,:-1])).sum())
-    # print(1.5 + gamma_a_reg - 1)
-    # print((weights.max(dim=1).values < 0.1).sum())
 
     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
     out = {
@@ -265,29 +229,22 @@ def march_rays_new(
     }
 
     if targets is not None:
-        log_p = torch.where(
-            mask,
-            -1.5 * math.log(math.pi * 2) + (1.5 + gamma_a_reg - 1) * log_var - var / 2 * (torch.sum((rgb - targets[:,None,:])**2, dim=2) + gamma_b_reg) + log_weights,
-            torch.full_like(raw_var, -float("inf"))
-        )
-        q = torch.softmax(log_p, dim=1).detach()
-        eq = mask / mask.sum(dim=1)[:,None]
-        eps = alpha**cur_step
-        q = eq * eps + q * (1 - eps)
-        # q = q * (1 - eps * mask.sum(dim=1))[:,None] + eps * mask
-        # log_q = F.log_softmax(log_p, dim=1).detach()
-        log_q = torch.log(q)
-        # print((log_weights != float("inf")).sum())
-        # print((q * mask).sum())
+        if raw_var is not None:
+            log_var = raw_var
+            var = raw_var.exp()
+            log_p = torch.where(
+                mask,
+                -1.5 * math.log(math.pi * 2) + (1.5) * log_var - var / 2 * (torch.sum((rgb - targets[:,None,:])**2, dim=2)) + log_weights,
+                torch.full_like(raw_var, -float("inf"))
+            )
+            q = torch.softmax(log_p, dim=1).detach()
+            eq = mask / mask.sum(dim=1)[:,None]
+            eps = alpha**cur_step
+            q = eq * eps + q * (1 - eps)
+            log_q = torch.log(q)
 
-        # q = log_p.exp()
-        # q /= q.sum(dim=1)
-        # print(torch.logical_and((q == 0), mask).sum())
-
-        elbo = torch.where(log_p == -float("inf"), torch.zeros_like(q), log_p * q).sum() - torch.where(log_q == -float("inf"), torch.zeros_like(q), log_q * q).sum()
-        out['elbo'] = elbo[None].detach()
-
-        # rgb_map = rgb_map + bkgd_color * (1. - acc_map[..., None])
+            elbo = torch.where(log_p == -float("inf"), torch.zeros_like(q), log_p * q).sum() - torch.where(log_q == -float("inf"), torch.zeros_like(q), log_q * q).sum()
+            out['elbo'] = elbo[None].detach()
 
         if lossfn == "lrf":
             losses = torch.sum(-torch.where(log_p == -float("inf"), torch.zeros_like(q), log_p * q), dim=1).sum()
@@ -306,11 +263,190 @@ def march_rays_new(
     return out
 
 
+def calc_rgb_map(rgb, sigma):
+    log_passed = -torch.logaddexp(sigma, torch.zeros_like(sigma))
+    log_not_passed = -torch.logaddexp(-sigma, torch.zeros_like(sigma))
+    log_weights = log_integrate(log_passed, log_not_passed)
+
+    weights = log_weights.exp()
+
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+    return rgb_map.detach()
+
+
+def log_joint(rgb, var, targets, sigma):
+    log_passed = -torch.logaddexp(sigma, torch.zeros_like(sigma))
+    log_not_passed = -torch.logaddexp(-sigma, torch.zeros_like(sigma))
+    log_weights = log_integrate(log_passed, log_not_passed)
+
+    log_var = torch.log(var)
+    log_p = -1.5 * math.log(math.pi * 2) - 1.5 * log_var - 1. / (2 * var) * torch.sum((rgb - targets[:,None,:])**2, dim=2) + log_weights
+    return log_p
+
+@torch.no_grad()
+def add_reg(elbo, model, new_tensor=False):
+    return elbo + \
+        torch.sum(model.vox_rgb.log_reg(new_tensor)) + \
+        torch.sum(model.vox_var.log_gamma_reg(new_tensor)) + \
+        torch.sum(model.vox_var.log_gamma_reg_bkgd(new_tensor)) + \
+        torch.sum(model.vox_sigma.log_reg(new_tensor))
+
+@torch.no_grad()
+def calc_alphas(targets, rgb_sparse, sigma_sparse, var_sparse, new_rgb=None, new_sigma=None, new_var=None):
+    log_p = log_joint(rgb_sparse, var_sparse, targets, sigma_sparse)
+
+    q = torch.softmax(log_p, dim=1).detach()
+    log_q = torch.log_softmax(log_p, dim=1).detach()
+
+    if new_rgb is None:
+        new_rgb = rgb_sparse
+    if new_sigma is None:
+        new_sigma = sigma_sparse
+    if new_var is None:
+        new_var = var_sparse
+
+    log_p_new = log_joint(new_rgb, new_var, targets, new_sigma)
+    elbo = torch.where(log_p_new == -float("inf"), torch.zeros_like(q), log_p_new * q).sum() - torch.where(log_q == -float("inf"), torch.zeros_like(q), log_q * q).sum()
+    return q, log_q, elbo[None].detach()
+
+@torch.no_grad()
+def march_rays_calc_rgb_map(
+        viewdirs,
+        pts,
+        model,
+        valid_mask,
+        white_bkgd=False):
+    N_batch, N_samples, _ = pts.shape
+    sh_dim = model.args.sh_basis_dim
+    d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
+
+    coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
+    d = d.view(-1, sh_dim)[valid_mask.view(-1)]
+    bkgd_rgb = 1. if white_bkgd else 0.
+    inf = -float("inf")
+
+    bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
+
+    def create_sparse(tensor, shape, init, mask=valid_mask):
+        tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
+        tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
+        return tensor_sparse
+
+    rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
+    sigma = model.vox_sigma.calc_sigma(coords_xyz)
+
+    rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
+    rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
+    sigma_sparse = create_sparse(sigma, (N_batch , N_samples), inf)
+
+    rgb_map = calc_rgb_map(rgb_sparse, sigma_sparse)
+    rgb_map = rgb_map * model.target_std + model.target_mean
+    out = {
+        "rgb_map": rgb_map,
+    }
+
+    return out
+
+
+@torch.no_grad()
+def march_rays_update_tensors(
+        viewdirs,
+        pts,
+        model,
+        valid_mask,
+        dists,
+        targets,
+        update=None,
+        calc_elbo_for_new=None,
+        white_bkgd=False):
+    
+
+    N_batch, N_samples = dists.shape
+    sh_dim = model.args.sh_basis_dim
+    d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
+
+    coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
+    d = d.view(-1, sh_dim)[valid_mask.view(-1)]
+    bkgd_rgb = 1. if white_bkgd else 0.
+    inf = -float("inf")
+
+    targets = (targets - model.target_mean) / model.target_std
+    bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
+
+    def create_sparse(tensor, shape, init, mask=valid_mask):
+        tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
+        tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
+        return tensor_sparse
+
+    rgb_sparse_new, var_sparse_new, sigma_sparse_new = None, None, None
+    if "var" in update or "rgb" in calc_elbo_for_new:
+        rgb_new = model.vox_rgb.calc_rgb(coords_xyz, d, new_tensor=True)
+        rgb_sparse_new = create_sparse(rgb_new, (N_batch, N_samples, 3), 0)
+        rgb_sparse_new = F.pad(rgb_sparse_new, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
+    if "var" in calc_elbo_for_new:
+        var_new = model.vox_var.calc_var(coords_xyz, new_tensor=True)
+        var_bkgd_new = model.vox_var.calc_var_bkgd(new_tensor=True)
+        var_sparse_new = create_sparse(var_new, (N_batch , N_samples), 1)
+        var_sparse_new = torch.cat([var_sparse_new, var_bkgd_new.expand(N_batch, 1)], dim=1)
+    if "sigma" in calc_elbo_for_new:
+        sigma_new = model.vox_sigma.calc_sigma(coords_xyz, new_tensor=True)
+        sigma_sparse_new = create_sparse(sigma_new, (N_batch , N_samples), inf)
+
+    rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
+    sigma = model.vox_sigma.calc_sigma(coords_xyz)
+    var = model.vox_var.calc_var(coords_xyz)
+    var_bkgd = model.vox_var.calc_var_bkgd()
+
+    rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
+    rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
+    sigma_sparse = create_sparse(sigma, (N_batch , N_samples), inf)
+    var_sparse = create_sparse(var, (N_batch , N_samples), 1)
+    var_sparse = torch.cat([var_sparse, var_bkgd.expand(N_batch, 1)], dim=1)
+
+    _,  log_alphas_sparsed, elbo = calc_alphas(targets, rgb_sparse, sigma_sparse, var_sparse, new_rgb=rgb_sparse_new, new_var=var_sparse_new, new_sigma=sigma_sparse_new)
+    rgb_map = calc_rgb_map(rgb_sparse, sigma_sparse)
+    rgb_map = rgb_map * model.target_std + model.target_mean
+    out = {
+        "elbo": elbo,
+        "rgb_map": rgb_map,
+    }
+
+    log_alphas = log_alphas_sparsed[:,:-1].reshape(-1)[valid_mask.view(-1)]
+    x = targets[:,None,:].repeat(1, N_samples, 1).view(-1, 3)[valid_mask.view(-1)]
+
+    if "rgb" in update:
+        model.vox_rgb.update_statistics(coords_xyz, log_alphas, d, x)
+
+    if "sigma" in update:
+        log_alphas_sumed_sparsed = log_alphas_sparsed.flip(1).logcumsumexp(1).flip(1)
+        model.vox_sigma.update_statistics(coords_xyz, log_alphas_sumed_sparsed[:,1:].reshape(-1)[valid_mask.view(-1)], log_alphas)
+
+    if "var" in update:
+        log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
+        errors = torch.sum((rgb_new - x)**2, dim=1) / 3
+        bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
+
+        model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
+        model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
+
+    if "var_by_old_rgb" in update:
+        log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
+        errors = torch.sum((rgb - x)**2, dim=1) / 3
+        bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
+
+        model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
+        model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
+
+    return out
+
+
 def render_rays(
         ray_batch,
         target_batch,
         model,
         N_samples,
+        update_statistics=[],
+        calc_elbo_for_new=[],
         use_viewdirs=False,
         dim_grid=None,
         perturb=0,
@@ -322,12 +458,11 @@ def render_rays(
         sigma_warmup_numsteps=None,
         cur_step=None,
         checks=True,
-        use_rgb_sigmoid=None,
         lossfn=None,
         alpha=None,
+        use_EM=0,
         sigma_activation='relu',
-        gamma_a_reg=None,
-        gamma_b_reg=None,
+        sample_points='adjusted',
         dist_constant=False,
         use_new_march_rays=False,
 ):
@@ -353,6 +488,35 @@ def render_rays(
       raw: [num_rays, num_samples, 4]. Raw predictions from model.
     """
 
+    if use_EM != 0:
+        N_rays, device = ray_batch.shape[0], ray_batch.device
+        rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]
+
+        z_vals, dists, valid_mask = model.get_intersect_coords(rays_o, rays_d)
+        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
+
+        if target_batch is None:
+            out = march_rays_calc_rgb_map(
+                rays_d,
+                pts,
+                model,
+                valid_mask,
+                white_bkgd=white_bkgd)
+        else:
+            out = march_rays_update_tensors(
+                rays_d,
+                pts,
+                model,
+                valid_mask,
+                dists,
+                target_batch,
+                calc_elbo_for_new=calc_elbo_for_new,
+                update=update_statistics,
+                white_bkgd=white_bkgd)
+            
+        return out
+
+
     def sample_rays(inputs, viewdirs):
         """
         Prepares inputs and applies network 'fn'.
@@ -371,20 +535,8 @@ def render_rays(
     if use_viewdirs:
         viewdirs = rays_d.clone()
 
-    if dist_constant:
-        z_vals = near + 2 * 3**0.5 / N_samples * torch.arange(N_samples + 1, device=device)
-        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        dists = mids[..., 1:] - mids[..., :-1]  # NR x (NS-1)
-        if perturb:
-            upper = z_vals[..., 1:]
-            lower = z_vals[..., :-1]
-            t_rand = torch.rand(mids.shape, device=device)
-            z_vals = lower + (upper - lower) * t_rand
-        else:
-            z_vals = mids
-        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
-
-    else:
+    valid_mask = None
+    if sample_points == 'adjusted':
         t_far = torch.linspace(0., 1.0, steps=N_samples, device=device)
         t_near = 1.0 - t_far
         z_vals = near * t_near + far * t_far
@@ -400,9 +552,30 @@ def render_rays(
             z_vals = lower + (upper - lower) * t_rand
 
         pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    elif sample_points == 'equal':
+        z_vals = near + 2 * 3**0.5 / N_samples * torch.arange(N_samples + 1, device=device)
+        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        dists = mids[..., 1:] - mids[..., :-1]  # NR x (NS-1)
+        if perturb:
+            upper = z_vals[..., 1:]
+            lower = z_vals[..., :-1]
+            t_rand = torch.rand(mids.shape, device=device)
+            z_vals = lower + (upper - lower) * t_rand
+        else:
+            z_vals = mids
+        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    elif sample_points == 'grid':
+        z_vals, valid_mask = model.get_intersect_coords(rays_o, rays_d)
+        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
+    # print(torch.floor((pts + 1) / 2 * dim_grid).long()[:10])
+    
     raw_rgb, raw_sigma, raw_var, mask = sample_rays(pts, viewdirs)
+    if valid_mask is None:
+        valid_mask = mask
 
+    # print((valid_mask.sum(dim=1) == 0).sum())
+    
     # if lossfn == 'lrf':
     if use_new_march_rays:
         out = march_rays_new(
@@ -418,11 +591,9 @@ def render_rays(
             cur_step=cur_step,
             alpha=alpha,
             lossfn=lossfn,
-            use_rgb_sigmoid=use_rgb_sigmoid,
-            gamma_a_reg=gamma_a_reg,
-            gamma_b_reg=gamma_b_reg,
             sigma_activation=sigma_activation)
     else:
+        z_vals *= (dim_grid - 1) * 0.5
         out = march_rays(
             raw_rgb,
             raw_sigma,
@@ -432,7 +603,6 @@ def render_rays(
             white_bkgd,
             lossfn=lossfn,
             ret_weights=N_importance > 0,
-            use_rgb_sigmoid=use_rgb_sigmoid,
             sigma_activation=sigma_activation)
 
     if N_importance > 0:
@@ -457,7 +627,7 @@ def render_rays(
 
         raw_rgb, raw_sigma = sample_rays(pts, viewdirs)
 
-        out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=False, use_rgb_sigmoid=use_rgb_sigmoid)
+        out = march_rays(raw_rgb, raw_sigma, z_vals, raw_noise_std, white_bkgd, ret_weights=False)
         out['rgb_map0'] = rgb_map0
 
     return out
@@ -478,7 +648,8 @@ def render_rays_chunks(rays_flat, chunk, targets, **kwargs):
 
 
 def render(
-        H, W, K, chunk, rays=None, targets=None, c2w=None, ndc=True, near=None, far=None,
+        H, W, K, chunk, rays=None, targets=None, update_statistics=None, c2w=None, ndc=True, near=None, far=None,
+        calc_elbo_for_new=None,
         adjust_near_far=False, filter_rays=False, dir_center_pix=True,
         sigma_warmup_sts=False,
         sigma_warmup_numsteps=None,
@@ -536,6 +707,8 @@ def render(
         sigma_warmup_sts=sigma_warmup_sts,
         sigma_warmup_numsteps=sigma_warmup_numsteps,
         cur_step=cur_step,
+        update_statistics=update_statistics,
+        calc_elbo_for_new=calc_elbo_for_new,
         **kwargs
     )
 
@@ -641,11 +814,14 @@ def config_parser():
                         help='use sigmoid on rgb')
     parser.add_argument("--sigma_activation", type=str, default='relu', choices=('relu', 'logloss'),
                         help='sigma activation')
-    parser.add_argument("--gamma_a_reg", type=float, default=1.)
-    parser.add_argument("--gamma_b_reg", type=float, default=0.)
     parser.add_argument("--dist_constant", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--use_new_march_rays", type=int, default=0)
+    parser.add_argument("--sample_points", type=str, default='equal', choices=('equal', 'adjusted', 'grid'))
+    parser.add_argument("--use_EM", type=int, default=0)
+    parser.add_argument("--normalize", type=int, default=0)
+    parser.add_argument("--intersect_threshold", type=float, default=1e-2)
+    parser.add_argument("--repeat", type=int, default=0)
     
     # Tacker voxel configuration
     parser.add_argument("--tacker_rank", type=int, default=64,
@@ -926,12 +1102,21 @@ def train():
         ds_near.append(near)
         ds_far.append(far)
         ds_target.append(target)
-
+    
     ds_rays_o = torch.cat(ds_rays_o, dim=0)
     ds_rays_d = torch.cat(ds_rays_d, dim=0)
     ds_near = torch.cat(ds_near, dim=0)
     ds_far = torch.cat(ds_far, dim=0)
     ds_target = torch.cat(ds_target, dim=0)
+
+    if args.normalize:
+        model.target_mean = ds_target.mean()
+        model.target_std = ds_target.std()
+        print("MEAN: ", model.target_mean.item())
+        print("STD: ", model.target_std.item())
+    else:
+        model.target_mean = 0
+        model.target_std = 1
 
     print('Begin')
     print('TRAIN views are', i_train)
@@ -966,7 +1151,6 @@ def train():
     
     model.train()
     j = 0
-    print(len(optimizers))
     for i, optimizer in zip(trange(0, args.N_iters + 1, disable=not args.i_tqdm), cycle(optimizers)):
         ids = next(id_sampler)
         rays_o = ds_rays_o[ids].to(args.device)
@@ -979,69 +1163,236 @@ def train():
         else:
             batch_rays = [rays_o, rays_d]
 
-        mse_loss = None
-        loss = None
+        if args.use_EM != 0:
+            if args.use_EM == 1:
+                with torch.no_grad():
+                    model.vox_rgb.zeros_statistics()
+                    model.vox_sigma.zeros_statistics()
+                    model.vox_var.zeros_statistics()
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=['rgb'],
+                        calc_elbo_for_new=[],
+                        **render_kwargs_train,
+                    )
+                    model.vox_rgb.calc_new_tensor(model.vox_var.contract().squeeze())
+                    print("ELBO after Q:", add_reg(out["elbo"].sum(), model).item())
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=['var'],
+                        calc_elbo_for_new=['rgb'],
+                        **render_kwargs_train,
+                    )
+                    model.vox_var.calc_new_tensor()
+                    print("ELBO after rgb:", add_reg(out["elbo"].sum(), model).item())
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=['sigma'],
+                        calc_elbo_for_new=['rgb', 'var'],
+                        **render_kwargs_train,
+                    )
+                    model.vox_sigma.calc_new_tensor()
+                    print("ELBO after var:", add_reg(out["elbo"].sum(), model).item())
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=[],
+                        calc_elbo_for_new=['rgb', 'var', 'sigma'],
+                        **render_kwargs_train,
+                    )
+                    print("ELBO after sigma:", add_reg(out["elbo"].sum(), model).item())
+                    model.vox_rgb.update_old_tensor()
+                    model.vox_sigma.update_old_tensor()
+                    model.vox_var.update_old_tensor()
+            elif args.use_EM == 2:
+                with torch.no_grad():
+                    model.vox_rgb.zeros_statistics()
+                    model.vox_sigma.zeros_statistics()
+                    model.vox_var.zeros_statistics()
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=['rgb'],
+                        calc_elbo_for_new=[],
+                        **render_kwargs_train,
+                    )
+                    model.vox_rgb.calc_new_tensor(model.vox_var.contract().squeeze())
+                    model.vox_rgb.update_old_tensor()
+                    print("ELBO after sigma:", add_reg(out["elbo"].sum(), model).item())
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=['var_by_old_rgb'],
+                        calc_elbo_for_new=[],
+                        **render_kwargs_train,
+                    )
+                    print("ELBO after rgb:", add_reg(out["elbo"].sum(), model).item())
+                    model.vox_var.calc_new_tensor()
+                    model.vox_var.update_old_tensor()
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=['sigma'],
+                        calc_elbo_for_new=[],
+                        **render_kwargs_train,
+                    )
+                    model.vox_sigma.calc_new_tensor()
+                    print(add_reg(out["elbo"].sum(), model).item())
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=[],
+                        calc_elbo_for_new=['sigma'],
+                        **render_kwargs_train,
+                    )
+                    model.vox_sigma.update_old_tensor()
+                    print("ELBO after var:", add_reg(out["elbo"].sum(), model).item())
+                    out["elbo"] = add_reg(out["elbo"].sum(), model)
+            elif args.use_EM == 3:
+                with torch.no_grad():
+                    model.vox_rgb.zeros_statistics()
+                    model.vox_sigma.zeros_statistics()
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=['rgb', 'sigma'],
+                        calc_elbo_for_new=[],
+                        **render_kwargs_train,
+                    )
+                    # model.vox_rgb.calc_new_tensor(model.vox_var.contract().squeeze())
+                    # model.vox_rgb.update_old_tensor()
+                    # model.vox_sigma.calc_new_tensor()
+                    # model.vox_sigma.update_old_tensor()
+                    model.vox_rgb.update_tensor(model.vox_var.contract().squeeze())
+                    model.vox_sigma.update_tensor()
+                    print("ELBO after var:", add_reg(out["elbo"].sum(), model).item())
+                    model.vox_sigma.zeros_statistics()
+                    model.vox_var.zeros_statistics()
+                    out = render(
+                        H, W, K,
+                        chunk=args.chunk,
+                        rays=batch_rays,
+                        targets=target,
+                        cur_step=i,
+                        update_statistics=['var_by_old_rgb', 'sigma'],
+                        calc_elbo_for_new=[],
+                        **render_kwargs_train,
+                    )
+                    print("ELBO after rgb:", add_reg(out["elbo"].sum(), model).item())
+                    out["elbo"] = add_reg(out["elbo"].sum(), model)
+                    # model.vox_var.calc_new_tensor()
+                    # model.vox_var.update_old_tensor()
+                    # model.vox_sigma.calc_new_tensor()
+                    # model.vox_sigma.update_old_tensor()
+                    model.vox_var.update_tensor()
+                    model.vox_sigma.update_tensor()
 
-        def closure():
-            nonlocal j
-            j += 1
 
-            optimizer.zero_grad()
 
-            out = render(
-                H, W, K,
-                chunk=args.chunk,
-                rays=batch_rays,
-                targets=target,
-                sigma_warmup_sts=args.sigma_warmup_sts,
-                sigma_warmup_numsteps=args.sigma_warmup_numsteps,
-                cur_step=j,
-                **render_kwargs_train
-            )
-
-            nonlocal mse_loss
-            nonlocal loss
             mse_loss = F.mse_loss(out['rgb_map'], target).detach().cpu()
-            loss = out['losses'].mean().detach().cpu()
-            
-
-            if j % args.i_print == 0:
+            if i % args.i_print == 0:
                 psnr = mse2psnr(mse_loss)
                 val = {
-                    "iter": j,
-                    "loss": loss.item(),
+                    "iter": i,
                     "mse_loss": mse_loss.item(),
                     "psrn": psnr.item(),
                 }
                 if "elbo" in out:
-                    print("ELBO: ", out['elbo'].sum(), i)
-                    val["elbo"] = out['elbo'].sum()
-                msg = f"[TRAIN] Iter: {j} of {args.N_iters}, loss: {loss.item()}"
+                    print("ELBO: ", out["elbo"])
+                    val["elbo"] = out["elbo"]
+                msg = f"[TRAIN] Iter: {i} of {args.N_iters}, loss: {mse_loss.item()}"
                 msg += f', PSNR: {psnr.item()}'
-                wandb.log(val, step=j)
+                wandb.log(val, step=i)
                 print(msg)
-
-
-            # if args.N_importance > 0:
-            #     img_loss0 = img2mse(out['rgb_map0'], target)
-            #     loss = loss + img_loss0
-
-            return loss
-
-        if args.optimizer in {"LBFGS", "SeparatedLBFGS"}:
-            optimizer.step(closure)
         else:
-            closure()
-            optimizer.step()
+            mse_loss = None
+            loss = None
+
+            def closure():
+                nonlocal j
+                j += 1
+
+                optimizer.zero_grad()
+
+                out = render(
+                    H, W, K,
+                    chunk=args.chunk,
+                    rays=batch_rays,
+                    targets=target,
+                    sigma_warmup_sts=args.sigma_warmup_sts,
+                    sigma_warmup_numsteps=args.sigma_warmup_numsteps,
+                    cur_step=j-1,
+                    **render_kwargs_train
+                )
+
+                nonlocal mse_loss
+                nonlocal loss
+                mse_loss = F.mse_loss(out['rgb_map'], target).detach().cpu()
+                loss = out['losses'].mean().detach().cpu()
+                
+
+                if j % args.i_print == 0:
+                    psnr = mse2psnr(mse_loss)
+                    val = {
+                        "iter": j,
+                        "loss": loss.item(),
+                        "mse_loss": mse_loss.item(),
+                        "psrn": psnr.item(),
+                    }
+                    if "elbo" in out:
+                        print("ELBO: ", out['elbo'].sum(), i)
+                        val["elbo"] = out['elbo'].sum()
+                    msg = f"[TRAIN] Iter: {j} of {args.N_iters}, loss: {loss.item()}"
+                    msg += f', PSNR: {psnr.item()}'
+                    wandb.log(val, step=j)
+                    print(msg)
+
+                return loss
+
+            if args.optimizer in {"LBFGS", "SeparatedLBFGS"}:
+                optimizer.step(closure)
+            else:
+                closure()
+                optimizer.step()
         
-        if args.optimizer != "LBFGS" and args.optimizer != "SeparatedLBFGS":
-            decay_rate = 0.1
-            new_lrate = args.lrate * (decay_rate ** (global_step / args.lrate_decay))
-            if args.lrate_warmup_steps > 0 and global_step < args.lrate_warmup_steps:
-                new_lrate *= global_step / args.lrate_warmup_steps
-            for param_group in optimizer.param_groups:
-                if param_group['tag'] == 'vox':
-                    param_group['lr'] = new_lrate
+            if args.optimizer != "LBFGS" and args.optimizer != "SeparatedLBFGS":
+                decay_rate = 0.1
+                new_lrate = args.lrate * (decay_rate ** (global_step / args.lrate_decay))
+                if args.lrate_warmup_steps > 0 and global_step < args.lrate_warmup_steps:
+                    new_lrate *= global_step / args.lrate_warmup_steps
+                for param_group in optimizer.param_groups:
+                    if param_group['tag'] == 'vox':
+                        param_group['lr'] = new_lrate
 
         # Rest is logging
 
@@ -1078,10 +1429,17 @@ def train():
             testsavedir = os.path.join(log_dir, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
 
+            trainsavedir = os.path.join(log_dir, 'trainset_{:06d}'.format(i))
+            os.makedirs(trainsavedir, exist_ok=True)
+
             model.eval()
             _, test_psnr, test_mse, test_ssim, test_lpips = render_path(
                 torch.Tensor(poses[i_test]), hwf, K, args.chunk, render_kwargs_test,
                 gt_imgs=images[i_test], savedir=testsavedir, compute_stats=True, desc='test set', device=args.device
+            )
+            _, train_psnr, train_mse, train_ssim, train_lpips = render_path(
+                torch.Tensor(poses[i_train]), hwf, K, args.chunk, render_kwargs_train,
+                gt_imgs=images[i_train], savedir=trainsavedir, compute_stats=True, desc='train set', device=args.device
             )
             model.train()
 
@@ -1090,7 +1448,14 @@ def train():
                 'test_psnr': test_psnr,
                 'test_ssim': test_ssim,
                 'test_lpips': test_lpips,
-            }, step=j)
+            }, step=i)
+
+            wandb.log({
+                'train_mse': train_mse,
+                'train_psnr': train_psnr,
+                'train_ssim': train_ssim,
+                'train_lpips': train_lpips,
+            }, step=i)
 
             # tb_add_scalars(tb, 'test', {
             #     'mse': test_mse,
@@ -1100,14 +1465,13 @@ def train():
             # }, global_step=i)
 
             tqdm.write(f"[TEST] Iter: {i} of {args.N_iters}, PSNR: {test_psnr}, SSIM: {test_ssim}, LPIPS: {test_lpips}")
+            tqdm.write(f"[TRAIN] Iter: {i} of {args.N_iters}, PSNR: {train_psnr}, SSIM: {train_ssim}, LPIPS: {train_lpips}")
 
         global_step += 1
 
     path = os.path.join(log_dir, 'final.pth')
     torch.save(render_kwargs_train['model'].state_dict(), path)
     tqdm.write(f'Saved model: {path}')
-    wandb.save(base_path=log_dir, glob_str="./*/*")
-    wandb.save(base_path=log_dir, glob_str="./*")
     wandb.finish()
 
 

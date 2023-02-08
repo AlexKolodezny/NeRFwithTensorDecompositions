@@ -50,6 +50,8 @@ class BaseNF(nn.Module):
         dim_payload,
         outliers_handling="zeros",
         return_mask=False,
+        sample_by_contraction=False,
+        trilinear=True,
     ) -> None:
         # assert len(dim_grid) == len(ranks)
         self.dim = 3
@@ -60,10 +62,13 @@ class BaseNF(nn.Module):
         # factory_kwargs = {"device": device, "dtype": dtype}
         super(BaseNF, self).__init__()
 
+        self.dim_payload = dim_payload
         self.dim_grid = dim_grid
         self.shape = (dim_grid,) * self.dim
         self.output_features = dim_payload
         self.return_mask = return_mask
+        self.sample_by_contraction = sample_by_contraction
+        self.trilinear = trilinear
 
     
     def calc_params(self):
@@ -128,7 +133,7 @@ class BaseNF(nn.Module):
         }[self.outliers_handling]
 
         batch_size, _ = coords_xyz.shape
-        mask_valid = torch.all(coords_xyz >= 0, dim=1) & torch.all(coords_xyz <= self.dim_grid - 1, dim=1)
+        mask_valid = torch.all(coords_xyz >= -1, dim=1) & torch.all(coords_xyz <= 1, dim=1)
         coords_xyz = coords_xyz[mask_valid]
         if coords_xyz.shape[0] == 0:
             if self.return_mask:
@@ -138,7 +143,10 @@ class BaseNF(nn.Module):
         mask_need_remap = coords_xyz.shape[0] < batch_size
         
 
-        result = self.sample_tensor_points(coords_xyz)
+        if self.sample_by_contraction:
+            result = self.contract_and_sample(coords_xyz)
+        else:
+            result = self.sample_tensor_points(self.coords_to_tensor(coords_xyz))
 
         
         if mask_need_remap:
@@ -154,6 +162,22 @@ class BaseNF(nn.Module):
     
     def sample_tensor_points(self, coords_xyz):
         pass
+    
+    def contract(self):
+        pass
+    
+    def contract_and_sample(self, coords_xyz):
+        num_samples, _ = coords_xyz.shape
+        tensor = self.contract()
+
+        if self.trilinear:
+            result = F.grid_sample(tensor.view(1, *tensor.shape), coords_xyz.view(1, num_samples, 1, 1, -1), align_corners=True)
+            return result.view(-1, num_samples).T
+        else:
+            result = F.grid_sample(tensor.view(1, *tensor.shape), coords_xyz.view(1, num_samples, 1, 1, -1), align_corners=False, mode='nearest')
+            return result.view(-1, num_samples).T
+            # x, y, z = torch.floor((coords_xyz + 1) / 2 * self.dim_grid).clip(0, 255).long().chunk(3, dim=1)
+            # return tensor[:, x.squeeze(), y.squeeze(), z.squeeze()].T
 
     
     def forward(self, coords_xyz: Tensor) -> Tensor:
@@ -161,5 +185,5 @@ class BaseNF(nn.Module):
         :param coords_xyz (torch.Tensor): sampled float points of shape [batch_rays x 3] in cube [0, dim_grid-1]^3
         :return:
         """
-        return self.sample_with_outlier_handling(self.coords_to_tensor(coords_xyz))
+        return self.sample_with_outlier_handling(coords_xyz)
         

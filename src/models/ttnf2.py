@@ -1,6 +1,7 @@
 from .tt_core import *
 from .base_nf import BaseNF
 import numpy as np
+from itertools import chain
 
 def coord_tensor_to_coord_tt(coords_xyz, dim_modes, chunk=False, checks=False):
     if checks:
@@ -51,6 +52,7 @@ class TTNF(BaseNF):
         self.verbose = verbose
 
         self.dim_modes = dim_modes
+        self.dim_payload = dim_payload
         self.tt_modes = list(map(lambda x: x**3, self.dim_modes)) + [dim_payload]
         self.tt_rank_max = tt_rank_max
         self.num_cores = len(self.tt_modes)
@@ -112,6 +114,11 @@ class TTNF(BaseNF):
             2: partial(sample_intcoord_tt_v2, last_core_is_payload=True),
             3: partial(sample_intcoord_tt_v3, last_core_is_payload=True, tt_core_isparam=self.tt_core_isparam),
         }[version_sample_qtt]
+
+        self.fn_contract_grid = compile_tt_contraction_fn(
+            self.tt_core_shapes,
+            report_flops=False
+        )
 
         self.dtype_sz_bytes = {
             torch.float16: 2,
@@ -202,7 +209,15 @@ class TTNF(BaseNF):
             qtt_reshape_plan=None,
             fn_contract=self.fn_contract_grid,
             checks=self.checks,
-        )
+        ).view(*chain(*[[dim] * 3 for dim in self.dim_modes]), self.dim_payload)\
+            .permute(
+                len(self.dim_modes) * 3,
+                *chain(
+                    range(0, len(self.dim_modes) * 3, 3),
+                    range(1, len(self.dim_modes) * 3, 3),
+                    range(2, len(self.dim_modes) * 3, 3)
+                )
+            ).reshape(self.dim_payload, self.dim_grid, self.dim_grid, self.dim_grid)
         return out
 
     def extra_repr(self) -> str:
