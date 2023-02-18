@@ -12,7 +12,8 @@ from ..models.vm import VMNF
 from ..models.skeleton import SkeletonNF
 from ..models.full import FullNF
 from ..models.full import FullNFForRGB
-from ..models.full import FullNFForSigma
+from ..models.full import FullNFForSigmaBetaDist
+from ..models.full import FullNFForSigmaExpDist
 from ..models.full import FullNFForVar
 from ..models.ttnf2 import TTNF
 
@@ -26,7 +27,8 @@ model_dict = {
     "SkeletonNF": SkeletonNF,
     "FullNF": FullNF,
     "FullNFForRGB": FullNFForRGB,
-    "FullNFForSigma": FullNFForSigma,
+    "FullNFForSigmaBetaDist": FullNFForSigmaBetaDist,
+    "FullNFForSigmaExpDist": FullNFForSigmaExpDist,
     "FullNFForVar": FullNFForVar,
 }
 
@@ -365,6 +367,6 @@ class RadianceField(torch.nn.Module):
         z = 0.5 * (t[:,1:] + t[:,:-1])
         dists = t[:, 1:] - t[:,:-1]
         mask = (z <= far[:,None]) & (z >= near[:,None]) & (dists >= eps) & (z >= 0)
-        
+
         return z, dists, mask
 

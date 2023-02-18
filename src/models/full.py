@@ -190,7 +190,7 @@ class FullNFForRGB(FullNF):
         return -0.5 / self.norm_var_reg * torch.sum(tensor**2, dim=0)
 
 
-class FullNFForSigma(FullNF):
+class FullNFForSigmaBetaDist(FullNF):
     def __init__(
         self,
         dim_grid,
@@ -203,7 +203,7 @@ class FullNFForSigma(FullNF):
         # assert len(dim_grid) == len(ranks)
         # factory_kwargs = {"device": device, "dtype": dtype}
         assert dim_payload == 1
-        super(FullNFForSigma, self).__init__(dim_grid, dim_payload, **kwargs)
+        super(FullNFForSigmaBetaDist, self).__init__(dim_grid, dim_payload, **kwargs)
 
         self.beta_a_reg = beta_a_reg
         self.beta_b_reg = beta_b_reg
@@ -296,7 +296,104 @@ class FullNFForSigma(FullNF):
             return - self.not_pass_statistics.squeeze() * F.softplus(-tensor)\
                 - self.pass_statistics.squeeze() * F.softplus(tensor)
 
+
+class FullNFForSigmaExpDist(FullNF):
+    def __init__(
+        self,
+        dim_grid,
+        dim_payload,
+        beta_a_reg=0,
+        beta_b_reg=0,
+        log_sum_trick=True,
+        **kwargs,
+    ) -> None:
+        # assert len(dim_grid) == len(ranks)
+        # factory_kwargs = {"device": device, "dtype": dtype}
+        assert dim_payload == 1
+        super(FullNFForSigmaExpDist, self).__init__(dim_grid, dim_payload, **kwargs)
+
+        self.beta_a_reg = beta_a_reg
+        self.beta_b_reg = beta_b_reg
+        self.sum_alphas = None
+        self.sum_betas = None
+        self.log_sum_trick = log_sum_trick
+
+    @torch.no_grad()
+    def zeros_statistics(self):
+        if self.log_sum_trick:
+            self.max_log_sum_alphas = torch.full(self.shape, fill_value=-float("inf"), device=self.tensor.device)
+            self.max_log_sum_betas = torch.full(self.shape, fill_value=-float("inf"), device=self.tensor.device)
+        self.sum_alphas = torch.zeros(self.shape + (1,), device=self.tensor.device)
+        self.sum_betas = torch.zeros(self.shape + (1,), device=self.tensor.device)
+
+    @torch.no_grad()
+    def to_tensor_coords(self, coords_xyz):
+        x, y, z = torch.floor((coords_xyz + 1) / 2 * self.dim_grid).clip(0, 255).long().chunk(3, dim=1)
+        x = x.squeeze()
+        y = y.squeeze()
+        z = z.squeeze()
+        return x, y, z
+
+    @torch.no_grad()
+    def update_statistics(self, coords_xyz, log_alphas, log_betas):
+        x, y, z = self.to_tensor_coords(coords_xyz)
+        if self.log_sum_trick:
+            coords = z + self.shape[-1] * (y + self.shape[-2]  * x)
+            self.max_log_sum_alphas = index_add_with_log_alphas(
+                [
+                    self.sum_alphas.view(self.shape[0] * self.shape[1] * self.shape[2], -1),
+                ],
+                self.max_log_sum_alphas.view(self.shape[0] * self.shape[1] * self.shape[2]),
+                [torch.ones_like(log_alphas)[:,None]],
+                log_alphas, 0, coords).view(self.shape)
+            self.max_log_sum_betas = index_add_with_log_alphas(
+                [
+                    self.sum_betas.view(self.shape[0] * self.shape[1] * self.shape[2], -1),
+                ],
+                self.max_log_sum_betas.view(self.shape[0] * self.shape[1] * self.shape[2]),
+                [torch.ones_like(log_betas)[:,None]],
+                log_betas, 0, coords).view(self.shape)
+        # else:
+            # self.pass_statistics[x,y,z] += torch.exp(log_p)[...,None]
+            # self.not_pass_statistics[x,y,z] += torch.exp(log_np)[...,None]
     
+    def update_old_tensor(self):
+        self.tensor.data = self.new_tensor
+    
+    def update_tensor(self):
+        self.tensor.data = torch.tensor(0.)
+        self.calc_new_tensor()
+        self.tensor.data = self.new_tensor
+        del self.new_tensor
+        del self.sum_alphas
+        del self.sum_betas
+        if self.log_sum_trick:
+            del self.max_log_sum_alphas
+            del self.max_log_sum_betas
+        torch.cuda.empty_cache()
+    
+    @torch.no_grad()
+    def calc_new_tensor(self):
+        if self.log_sum_trick:
+            self.new_tensor = (
+                (self.sum_alphas * torch.exp(self.max_log_sum_alphas)[...,None] + self.beta_a_reg) / \
+                (self.sum_betas * torch.exp(self.max_log_sum_betas)[...,None] + self.beta_b_reg)
+            ).view((1,) + self.shape)
+        # else:
+        #     self.new_tensor = (
+        #         torch.log(self.not_pass_statistics + self.beta_a_reg) - \
+        #         (torch.log(self.pass_statistics + self.beta_b_reg))
+        #     ).view((1,) + self.shape)
+    
+    def calc_sigma(self, coords_xyz, new_tensor=False):
+        x, y, z = self.to_tensor_coords(coords_xyz)
+        tensor = self.contract(new_tensor)
+        return tensor.squeeze()[x, y, z]
+    
+    def log_reg(self, new_tensor=False):
+        tensor = self.contract(new_tensor)
+        return + self.beta_a_reg * torch.log(tensor) - self.beta_b_reg * tensor
+
 
 class FullNFForVar(FullNF):
     def __init__(
