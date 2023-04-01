@@ -41,6 +41,8 @@ class FullNF(BaseNF):
     def sample_tensor_points(self, coords_xyz):
         num_samples, _ = coords_xyz.shape
 
+        print(num_samples)
+
         coords_xyz = coords_xyz / (self.dim_grid - 1) * 2 - 1
         
         result = F.grid_sample(self.tensor.unsqueeze(0), coords_xyz.view(1, num_samples, 1, 1, -1), align_corners=True).view(-1, num_samples).T

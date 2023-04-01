@@ -11,6 +11,7 @@ class SkeletonNF(BaseNF):
         dim_grid,
         dim_payload,
         skeleton_rank=None,
+        scale=1.,
         **kwargs,
     ) -> None:
         # assert len(dim_grid) == len(ranks)
@@ -28,14 +29,15 @@ class SkeletonNF(BaseNF):
             for i in range(len(self.shape))
         ])
 
+        self.scale = scale
+
         self.reset_parameters()
 
         self.calc_params()
 
 
     def calculate_std(self) -> float:
-        scale = 1.
-        return torch.exp(1/2 * (torch.tensor(scale).log() - 0.5 * torch.tensor(self.ranks).sum().log()))
+        return torch.exp(1/2 * (torch.tensor(self.scale).log() - 0.5 * torch.tensor(self.ranks).sum().log()))
 
     def reset_parameters(self) -> None:
         std = self.calculate_std()
@@ -69,6 +71,49 @@ class SkeletonNF(BaseNF):
         ]
 
         return sum(results)
+    
+    def calc_sigma(self, coords_xyz):
+        num_samples, _ = coords_xyz.shape
+        M = torch.cat([
+            F.grid_sample(
+                matrix[None,:,:,:],
+                coords_xyz[None,:,None,[y,z]].detach(),
+                align_corners=True).view(-1, num_samples)
+            for (x, y, z), matrix in zip([(0, 1, 2), (1, 0, 2), (2, 0, 1)], self.matrices)
+        ], dim=0)
+        V = torch.cat([
+            F.grid_sample(
+                (vector[...,-1].T)[None,:,:,None],
+                torch.stack([torch.zeros_like(coords_xyz[None,:,None,x]), coords_xyz[None,:,None,x], ], dim=3).detach(),
+                align_corners=True).view(-1, num_samples)
+            for (x, y, z), vector in zip([(0, 1, 2), (1, 0, 2), (2, 0, 1)], self.vectors)
+        ], dim=0)
+        return (V * M).sum(dim=0)
+    
+    def calc_rgb(self, coords_xyz):
+        num_samples, _ = coords_xyz.shape
+        xs, ys, zs, wx, wy, wz = self.get_cubes_and_weights(self.coords_to_tensor(coords_xyz))
+
+        Ms = [
+            F.grid_sample(
+                matrix[None,:,:,:],
+                coords_xyz[None,:,None,[y,z]].detach(),
+                align_corners=True).view(-1, num_samples).T
+            for (x, y, z), matrix in zip([(0, 1, 2), (1, 0, 2), (2, 0, 1)], self.matrices)
+        ]
+
+        results = [
+            (batched_indexed_gemv(
+                M[:,None,:].repeat(1,2,1).view(num_samples * 2, -1),
+                vector[...,:-1],
+                coo.view(num_samples * 2)
+            ).view(num_samples, 2, self.output_features - 1) * w[:,:,None]).sum(1)
+            for coo, w, M, vector in zip((xs, ys, zs), (wx, wy, wz), Ms, self.vectors)
+        ]
+
+        return sum(results)
+
+
     
     def contract(self):
         return \

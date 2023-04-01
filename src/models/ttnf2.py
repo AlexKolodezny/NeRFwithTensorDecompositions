@@ -35,6 +35,7 @@ class TTNF(BaseNF):
             dtype=torch.float32,
             checks=False,
             verbose=False,
+            scale=1,
             **kwargs,
     ):
         super().__init__(dim_grid, dim_payload, **kwargs)
@@ -93,7 +94,7 @@ class TTNF(BaseNF):
             num_buffers_on_the_right = list(reversed(self.tt_core_isparam)).index(True)
             ranks_between_two_param_cores = self.tt_ranks[1 + num_buffers_on_the_left: -1 - num_buffers_on_the_right]
             d = sum([int(a) for a in self.tt_core_isparam])
-            self.sigma_cores = (-torch.tensor(ranks_between_two_param_cores).double().log().sum() / (2. * d)).exp().item()
+            self.sigma_cores = (torch.tensor(scale).log() / d - torch.tensor(ranks_between_two_param_cores).double().log().sum() / (2. * d)).exp().item()
             for i, c in enumerate(self.get_cores()):
                 if not self.tt_core_isparam[i]:
                     continue
@@ -209,8 +210,9 @@ class TTNF(BaseNF):
             qtt_reshape_plan=None,
             fn_contract=self.fn_contract_grid,
             checks=self.checks,
-        ).view(*chain(*[[dim] * 3 for dim in self.dim_modes]), self.dim_payload)\
-            .permute(
+        )
+        out = out.view(*chain(*[[dim] * 3 for dim in self.dim_modes]), self.dim_payload)
+        out = out.permute(
                 len(self.dim_modes) * 3,
                 *chain(
                     range(0, len(self.dim_modes) * 3, 3),

@@ -6,18 +6,20 @@ log_root = log
 
 white_bkgd = True
 
+device=cuda:0
+
 lrate = 3e-3
-lrate_decay = 30000
+lrate_decay = 80000
 lrate_warmup_steps = 1000
 N_samples = 512
 N_importance = 0
 N_rand = 4096
-N_iters = 30000
+N_iters = 40000
 i_img = 2000
 i_img_ids = [1]
 i_testset = 10000
-i_video = 80000
-i_print=100
+i_video = 100000
+i_print=10
 i_wandb=0
 
 lossfn = mse
@@ -28,8 +30,7 @@ scene_scale = 0.8
 
 dim_grid = 256
 
-model = VMNF
-vm_rank=48
-init_method = normal
+models = '{"rgb": {"model": "VMNF","vm_rank": 48, "return_mask": 1}}'
+sigma_warmup_sts=1
 dtype = float32
 checks = 0

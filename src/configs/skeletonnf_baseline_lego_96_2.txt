@@ -19,7 +19,7 @@ i_img = 2000
 i_img_ids = [1]
 i_testset = 20000
 i_video = 100000
-i_print=100
+i_print=1
 i_wandb=0
 
 lossfn = mse

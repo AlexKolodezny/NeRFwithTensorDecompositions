@@ -5,17 +5,21 @@ import torch.nn.functional as F
 import json
 from copy import deepcopy
 
-from .helpers import positional_encoding
-from ..models.qttnf import QTTNF
+from .helpers import positional_encoding, integrate_new
+from ..models.qttnf2 import QTTNF
 from ..models.tacker import TackerNF
 from ..models.vm import VMNF
 from ..models.skeleton import SkeletonNF
+from ..models.skeleton_v2 import SkeletonV2NF
 from ..models.full import FullNF
 from ..models.full import FullNFForRGB
 from ..models.full import FullNFForSigmaBetaDist
 from ..models.full import FullNFForSigmaExpDist
 from ..models.full import FullNFForVar
 from ..models.ttnf2 import TTNF
+from ..models.ttcp import TTCPNF
+from ..models.tttacker import TTTackerNF
+from ..models.vttm import VTTMNF
 
 from ..models.spherical_harmonics import spherical_harmonics_bases
 
@@ -23,13 +27,17 @@ model_dict = {
     "QTTNF": QTTNF,
     "TTNF": TTNF,
     "TackerNF": TackerNF,
-    "VNMF": VMNF,
+    "VMNF": VMNF,
     "SkeletonNF": SkeletonNF,
+    "SkeletonV2NF": SkeletonV2NF,
     "FullNF": FullNF,
     "FullNFForRGB": FullNFForRGB,
     "FullNFForSigmaBetaDist": FullNFForSigmaBetaDist,
     "FullNFForSigmaExpDist": FullNFForSigmaExpDist,
     "FullNFForVar": FullNFForVar,
+    "TTCPNF": TTCPNF,
+    "TTTackerNF": TTTackerNF,
+    "VTTMNF": VTTMNF,
 }
 
 class ShaderBase(torch.nn.Module):
@@ -58,18 +66,24 @@ class ShaderSphericalHarmonics(ShaderBase):
         :param feat_rgb (torch.Tensor): directions corresponding to inputs rays of shape [batch x ray x rgb_feat_dim]
         :return:
         """
-        if self.checks:
-            assert feat_rgb.dim() == 3
-            B, R, X = feat_rgb.shape
-            assert X == 3 * self.sh_basis_dim
-            assert viewdirs.shape == (B, 3)
-        else:
+        # if self.checks:
+        #     assert feat_rgb.dim() == 3
+        #     B, R, X = feat_rgb.shape
+        #     assert X == 3 * self.sh_basis_dim
+        #     assert viewdirs.shape == (B, 3)
+        # else:
+        if len(feat_rgb.shape) == 3:
             B, R, _ = feat_rgb.shape
-
-        rgb = feat_rgb.view(B, R, 3, self.sh_basis_dim)  # B x R x 3 x SH
-        sh_mult = spherical_harmonics_bases(self.sh_basis_dim, viewdirs)  # B x SH
-        sh_mult = sh_mult.view(B, 1, 1, self.sh_basis_dim)  # B x 1 x 1 x SH
-        rgb = (rgb * sh_mult).sum(dim=-1)  # B x R x 3
+            rgb = feat_rgb.view(B, R, 3, self.sh_basis_dim)  # B x R x 3 x SH
+            sh_mult = spherical_harmonics_bases(self.sh_basis_dim, viewdirs)  # B x SH
+            sh_mult = sh_mult.view(B, 1, 1, self.sh_basis_dim)  # B x 1 x 1 x SH
+            rgb = (rgb * sh_mult).sum(dim=-1)  # B x R x 3
+        else:
+            B, _ = feat_rgb.shape
+            rgb = feat_rgb.view(B, 3, self.sh_basis_dim)  # B x R x 3 x SH
+            sh_mult = spherical_harmonics_bases(self.sh_basis_dim, viewdirs)  # B x SH
+            sh_mult = sh_mult.view(B, 1, self.sh_basis_dim)  # B x 1 x 1 x SH
+            rgb = (rgb * sh_mult).sum(dim=-1)  # B x 3
 
         return rgb
 
@@ -143,7 +157,7 @@ class RadianceField(torch.nn.Module):
         if args.shading_mode == 'spherical_harmonics':
             self.shader = ShaderSphericalHarmonics(args.sh_basis_dim, checks=args.checks)
         elif args.shading_mode == 'mlp':
-            self.shader = ShaderTensorF(args.rgb_feature_dim)
+            self.shader = ShaderMLP(args.rgb_feature_dim)
         elif args.shading_mode == "indetity":
             self.shader = ShaderSimple()
         else:
@@ -252,7 +266,7 @@ class RadianceField(torch.nn.Module):
             sigma = self.vox_sigma(coords_xyz)
         else:
             rgb, sigma = rgb[..., :-1], rgb[..., -1]  # B x R x 3 * (SH or 1), B x R
-
+        
         rgb, sigma = rgb.view(B, R, -1), sigma.view(B, R)
         rgb = self.shader(coords_xyz, viewdirs, rgb)
         if self.args.use_rgb_sigmoid:
@@ -275,6 +289,87 @@ class RadianceField(torch.nn.Module):
         #     raise ValueError(f'Invalid grid type: "{self.args.grid_type}"')
 
         return rgb, sigma, var, mask
+    
+    def render_rays(
+            self,
+            ray_batch,
+            N_samples,
+            cur_step=None,
+    ):
+        N_rays, device = ray_batch.shape[0], ray_batch.device
+        rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]
+        near, far = ray_batch[:, 6:7], ray_batch[:, 7:8]
+        viewdirs = rays_d.clone()
+
+        t_far = torch.linspace(0., 1.0, steps=N_samples, device=device)
+        t_near = 1.0 - t_far
+        z_vals = near * t_near + far * t_far
+        z_vals = z_vals.expand([N_rays, N_samples])
+
+        if self.args.perturb:
+            # get intervals between samples
+            mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+            upper = torch.cat([mids, z_vals[..., -1:]], -1)
+            lower = torch.cat([z_vals[..., :1], mids], -1)
+            # stratified samples in those intervals
+            t_rand = torch.rand(z_vals.shape, device=device)
+            z_vals = lower + (upper - lower) * t_rand
+
+        dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
+        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
+
+        B, R, _ = pts.shape
+        coords_xyz = pts.view(B * R, 3)
+
+        mask = torch.all(pts >= -1, dim=-1) & torch.all(pts <= 1, dim=-1)
+
+        sigma = torch.zeros(B, R, device=pts.device, dtype=pts.dtype)
+        if mask.any():
+            if "sigma" in self.models_config:
+                raw_sigma = self.vox_sigma(pts[mask].detach()).view(-1)
+            else:
+                raw_sigma = self.vox_rgb.calc_sigma(pts[mask].detach())
+            
+            sigma[mask] = raw_sigma
+        
+        # if self.args.sigma_warmup_sts and cur_step <= self.args.sigma_warmup_numsteps:
+        #     sigma = sigma * (cur_step / self.args.sigma_warmup_numsteps)
+
+        if self.args.sigma_activation == 'relu':
+            sigma = F.relu(sigma.clone())  # NR x NS
+            integrate_fn = integrate_new
+            weights = integrate_fn(sigma, dists)  # NR x NS
+        elif self.args.sigma_activation == "logloss":
+            sigma = F.softplus(sigma)
+            integrate_fn = integrate_new
+            weights = integrate_fn(sigma, dists)  # NR x NS
+        
+        app_mask = mask
+        if self.args.weight_threshold is not None:
+            app_mask = app_mask & (weights > self.args.weight_threshold)
+        
+        # weights[~app_mask] = 0
+        rgb = torch.zeros(B, R, 3, device=pts.device, dtype=pts.dtype)
+
+        if app_mask.any():
+            if "sigma" in self.models_config:
+                raw_rgb = self.vox_rgb(pts[app_mask])
+            else:
+                raw_rgb = self.vox_rgb.calc_rgb(pts[app_mask])
+            
+            raw_rgb = self.shader(pts[app_mask], viewdirs[:,None,:].repeat(1, R, 1)[app_mask], raw_rgb)
+
+            rgb[app_mask] = raw_rgb
+        
+        if self.args.use_rgb_sigmoid:
+            rgb = torch.sigmoid(rgb)  # NR x NS x 3
+        rgb = F.pad(rgb, (0, 0, 0, 1), mode="constant", value=self.bkgd_rgb)
+            
+        weights = torch.cat([weights, 1. - weights.sum(dim=1)[:,None]], dim=1)
+
+        rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+
+        return rgb_map, weights
 
     def get_param_groups(self):
         if self.args.optimizer == "SeparatedLBFGS":

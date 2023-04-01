@@ -20,24 +20,27 @@ class VMNF(BaseNF):
         dim_grid,
         dim_payload,
         vm_rank=None,
-        outliers_handling="zeros",
+        scale=1,
+        **kwargs,
             
     ) -> None:
         # assert len(dim_grid) == len(ranks)
         # factory_kwargs = {"device": device, "dtype": dtype}
-        super(VMNF, self).__init__(dim_grid, dim_payload, outliers_handling=outliers_handling)
+        super(VMNF, self).__init__(dim_grid, dim_payload, **kwargs)
 
         self.ranks = (vm_rank,) * self.dim
 
         self.vectors = nn.ParameterList([
-            Parameter(torch.empty(( self.ranks[i], self.shape[i])))
+            Parameter(torch.empty((1,self.ranks[i], self.shape[i],1)))
             for i in range(len(self.shape))
         ])
         self.matrices = nn.ParameterList([
-            Parameter(torch.empty(self.ranks[i:i+1] + self.shape[:i] + self.shape[i+1:]))
+            Parameter(torch.empty((1,) + self.ranks[i:i+1] + self.shape[:i] + self.shape[i+1:]))
             for i in range(len(self.shape))
         ])
         self.B = nn.Linear(sum(self.ranks), self.output_features, bias=False)
+
+        self.scale = scale
 
         self.reset_parameters()
 
@@ -46,7 +49,8 @@ class VMNF(BaseNF):
 
     def calculate_std(self) -> float:
         scale = 1.
-        return torch.exp(1/3 * (torch.tensor(scale).log() - 0.5 * torch.tensor(self.ranks).sum().log()))
+        return 0.1
+        # return torch.exp(1/3 * (torch.tensor(scale).log() - 0.5 * torch.tensor(self.ranks).sum().log()))
 
     def reset_parameters(self) -> None:
         std = self.calculate_std()
@@ -58,7 +62,7 @@ class VMNF(BaseNF):
 
     
     def sample_tensor_points(self, coords_xyz):
-        # num_samples, _ = coords_xyz.shape
+        num_samples, _ = coords_xyz.shape
         # coo_cube, w = self.get_cubes_and_weights(coords_xyz)
         # coo_cube = coo_cube.view(8 * num_samples,3)
         # w = w.view(8 * num_samples)
@@ -67,17 +71,17 @@ class VMNF(BaseNF):
 
         M = torch.cat([
             F.grid_sample(
-                matrix[None,:,:,:],
+                matrix,
                 coords_xyz[None,:,None,[y,z]].detach(),
-                align_corners=True).squeeze()
+                align_corners=True).view(-1, num_samples)
             for (x, y, z), matrix in zip([(0, 1, 2), (1, 0, 2), (2, 0, 1)], self.matrices)
         ], dim=0)
         V = torch.cat([
             F.grid_sample(
-                vector[None,:,:,None],
-                torch.stack([coords_xyz[None,:,None,x], torch.zeros_like(coords_xyz[None,:,None,x])], dim=3).detach(),
-                align_corners=True).squeeze()
+                vector,
+                torch.stack([torch.zeros_like(coords_xyz[None,:,None,x]), coords_xyz[None,:,None,x], ], dim=3).detach(),
+                align_corners=True).view(-1, num_samples)
             for (x, y, z), vector in zip([(0, 1, 2), (1, 0, 2), (2, 0, 1)], self.vectors)
         ], dim=0)
 
-        return self.B((M * V).transpose(0, 1))
+        return self.B((M * V).T)

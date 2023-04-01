@@ -8,6 +8,8 @@ import imageio
 from tqdm import tqdm, trange
 import wandb
 
+import time
+
 from .helpers import *
 from .load_blender import load_blender_data
 from .radiance_field import RadianceField
@@ -56,7 +58,7 @@ def create_model(args):
         optimizers = [torch.optim.LBFGS(
             params=model.parameters(),
             lr=args.lrate,
-            line_search_fn = 'strong_wolfe',
+            history_size=args.history_size,
             max_iter=args.lbfgs_iters,
         )]
     elif args.optimizer == "SeparatedLBFGS":
@@ -129,6 +131,16 @@ def integrate_exp(exp_sigma, dists):
     return weights
 
 
+def raw2alpha(sigma, dist):
+    # sigma, dist  [N_rays, N_samples]
+    alpha = 1. - torch.exp(-sigma*dist)
+
+    T = torch.cumprod(torch.cat([torch.ones(alpha.shape[0], 1).to(alpha.device), 1. - alpha + 1e-10], -1), -1)
+
+    weights = alpha * T[:, :-1]  # [N_rays, N_samples]
+    return alpha, weights, T[:,-1:]
+
+
 def march_rays(
         raw_rgb,
         raw_sigma,
@@ -152,19 +164,17 @@ def march_rays(
         sigma = F.relu(raw_sigma)  # NR x NS
         integrate_fn = integrate_new if use_new_integration else integrate_old
         weights = integrate_fn(sigma, dists)  # NR x NS
+        # dists = torch.cat((z_vals[:, 1:] - z_vals[:, :-1], torch.zeros_like(z_vals[:, :1])), dim=-1)
+        # integrate_fn = raw2alpha
+        # _, weights, bg_weight = integrate_fn(sigma, dists)  # NR x NS
     elif sigma_activation == "logloss":
         sigma = F.softplus(raw_sigma)
         integrate_fn = integrate_new if use_new_integration else integrate_old
         weights = integrate_fn(sigma, dists)  # NR x NS
         
-
-    # print(weights.sum(dim=1).mean())
-
     weights = torch.cat([weights, 1. - weights.sum(dim=1)[:,None]], dim=1)
 
     rgb_map = torch.sum(weights[..., None] * raw_rgb, -2)  # [N_rays, 3]
-
-    # print(rgb_map.mean())
 
     out = {'rgb_map': rgb_map.detach()}
     if ret_weights:
@@ -182,484 +192,484 @@ def march_rays(
     return out
 
 
-def log_integrate(log_passed, log_not_passed):
-    log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
-    log_alpha = log_not_passed  # NR x NS
-    cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
-    return torch.cat([log_alpha + cum_log_att_exclusive, log_passed.sum(dim=1)[:,None]], dim=1)
+# def log_integrate(log_passed, log_not_passed):
+#     log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
+#     log_alpha = log_not_passed  # NR x NS
+#     cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
+#     return torch.cat([log_alpha + cum_log_att_exclusive, log_passed.sum(dim=1)[:,None]], dim=1)
 
 
-def march_rays_new(
-        raw_rgb,
-        raw_sigma,
-        raw_var,
-        mask,
-        z_vals,
-        targets,
-        raw_noise_std=0.,
-        white_bkgd=False,
-        ret_weights=False,
-        use_new_integration=True,
-        sigma_activation=None,
-        alpha=None,
-        cur_step=None,
-        lossfn=None,
-):
-    assert sigma_activation == 'logloss'
+# def march_rays_new(
+#         raw_rgb,
+#         raw_sigma,
+#         raw_var,
+#         mask,
+#         z_vals,
+#         targets,
+#         raw_noise_std=0.,
+#         white_bkgd=False,
+#         ret_weights=False,
+#         use_new_integration=True,
+#         sigma_activation=None,
+#         alpha=None,
+#         cur_step=None,
+#         lossfn=None,
+# ):
+#     assert sigma_activation == 'logloss'
 
-    NR, NS = raw_sigma.shape
+#     NR, NS = raw_sigma.shape
 
-    if raw_noise_std > 0.:
-        raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
+#     if raw_noise_std > 0.:
+#         raw_sigma += torch.randn(NR, NS, device=raw_sigma.device) * raw_noise_std  # NR x NS
 
-    rgb = raw_rgb
-    raw_sigma = torch.where(mask, raw_sigma, torch.full_like(raw_sigma, -float("inf")))
-    mask = F.pad(mask, (0, 1), mode="constant", value=True)
+#     rgb = raw_rgb
+#     raw_sigma = torch.where(mask, raw_sigma, torch.full_like(raw_sigma, -float("inf")))
+#     mask = F.pad(mask, (0, 1), mode="constant", value=True)
 
-    sigma = raw_sigma
-    log_passed = -torch.logaddexp(raw_sigma, torch.zeros_like(raw_sigma))
-    log_not_passed = -torch.logaddexp(-raw_sigma, torch.zeros_like(raw_sigma))
+#     sigma = raw_sigma
+#     log_passed = -torch.logaddexp(raw_sigma, torch.zeros_like(raw_sigma))
+#     log_not_passed = -torch.logaddexp(-raw_sigma, torch.zeros_like(raw_sigma))
 
-    log_weights = log_integrate(log_passed, log_not_passed)
-    weights = log_weights.exp()
+#     log_weights = log_integrate(log_passed, log_not_passed)
+#     weights = log_weights.exp()
 
-    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
-    out = {
-        'rgb_map': rgb_map.detach(),
-    }
+#     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+#     out = {
+#         'rgb_map': rgb_map.detach(),
+#     }
 
-    if targets is not None:
-        if raw_var is not None:
-            log_var = raw_var
-            var = raw_var.exp()
-            log_p = torch.where(
-                mask,
-                -1.5 * math.log(math.pi * 2) + (1.5) * log_var - var / 2 * (torch.sum((rgb - targets[:,None,:])**2, dim=2)) + log_weights,
-                torch.full_like(raw_var, -float("inf"))
-            )
-            q = torch.softmax(log_p, dim=1).detach()
-            eq = mask / mask.sum(dim=1)[:,None]
-            eps = alpha**cur_step
-            q = eq * eps + q * (1 - eps)
-            log_q = torch.log(q)
+#     if targets is not None:
+#         if raw_var is not None:
+#             log_var = raw_var
+#             var = raw_var.exp()
+#             log_p = torch.where(
+#                 mask,
+#                 -1.5 * math.log(math.pi * 2) + (1.5) * log_var - var / 2 * (torch.sum((rgb - targets[:,None,:])**2, dim=2)) + log_weights,
+#                 torch.full_like(raw_var, -float("inf"))
+#             )
+#             q = torch.softmax(log_p, dim=1).detach()
+#             eq = mask / mask.sum(dim=1)[:,None]
+#             eps = alpha**cur_step
+#             q = eq * eps + q * (1 - eps)
+#             log_q = torch.log(q)
 
-            elbo = torch.where(log_p == -float("inf"), torch.zeros_like(q), log_p * q).sum() - torch.where(log_q == -float("inf"), torch.zeros_like(q), log_q * q).sum()
-            out['elbo'] = elbo[None].detach()
+#             elbo = torch.where(log_p == -float("inf"), torch.zeros_like(q), log_p * q).sum() - torch.where(log_q == -float("inf"), torch.zeros_like(q), log_q * q).sum()
+#             out['elbo'] = elbo[None].detach()
 
-        if lossfn == "lrf":
-            losses = torch.sum(-torch.where(log_p == -float("inf"), torch.zeros_like(q), log_p * q), dim=1).sum()
-            out['losses'] = losses[None].detach()
-        else:
-            losses = {
-                'huber': F.huber_loss,
-                'mse': F.mse_loss,
-            }[lossfn](rgb_map, targets)
-            out['losses'] = losses[None].detach()
-        losses.backward()
-    if ret_weights:
-        out['weights'] = weights.detach()
-    # print(out['losses'].sum())
+#         if lossfn == "lrf":
+#             losses = torch.sum(-torch.where(log_p == -float("inf"), torch.zeros_like(q), log_p * q), dim=1).sum()
+#             out['losses'] = losses[None].detach()
+#         else:
+#             losses = {
+#                 'huber': F.huber_loss,
+#                 'mse': F.mse_loss,
+#             }[lossfn](rgb_map, targets)
+#             out['losses'] = losses[None].detach()
+#         losses.backward()
+#     if ret_weights:
+#         out['weights'] = weights.detach()
+#     # print(out['losses'].sum())
 
-    return out
-
-
-def calc_rgb_map(rgb, sigma):
-    log_passed = -torch.logaddexp(sigma, torch.zeros_like(sigma))
-    log_not_passed = -torch.logaddexp(-sigma, torch.zeros_like(sigma))
-    log_weights = log_integrate(log_passed, log_not_passed)
-
-    weights = log_weights.exp()
-
-    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
-    return rgb_map.detach()
+#     return out
 
 
-def log_joint(rgb, var, targets, sigma):
-    log_passed = -torch.logaddexp(sigma, torch.zeros_like(sigma))
-    log_not_passed = -torch.logaddexp(-sigma, torch.zeros_like(sigma))
-    log_weights = log_integrate(log_passed, log_not_passed)
+# def calc_rgb_map(rgb, sigma):
+#     log_passed = -torch.logaddexp(sigma, torch.zeros_like(sigma))
+#     log_not_passed = -torch.logaddexp(-sigma, torch.zeros_like(sigma))
+#     log_weights = log_integrate(log_passed, log_not_passed)
 
-    log_var = torch.log(var)
-    log_p = -1.5 * math.log(math.pi * 2) - 1.5 * log_var - 1. / (2 * var) * torch.sum((rgb - targets[:,None,:])**2, dim=2) + log_weights
-    return log_p
+#     weights = log_weights.exp()
 
-
-@torch.no_grad()
-def add_reg(elbo, model, new_tensor=False):
-    return elbo + \
-        torch.sum(model.vox_rgb.log_reg(new_tensor)) + \
-        torch.sum(model.vox_var.log_gamma_reg(new_tensor)) + \
-        torch.sum(model.vox_var.log_gamma_reg_bkgd(new_tensor)) + \
-        torch.sum(model.vox_sigma.log_reg(new_tensor))
-
-@torch.no_grad()
-def calc_alphas(targets, rgb_sparse, sigma_sparse, var_sparse, new_rgb=None, new_sigma=None, new_var=None):
-    log_p = log_joint(rgb_sparse, var_sparse, targets, sigma_sparse)
-
-    q = torch.softmax(log_p, dim=1).detach()
-    log_q = torch.log_softmax(log_p, dim=1).detach()
-
-    if new_rgb is None:
-        new_rgb = rgb_sparse
-    if new_sigma is None:
-        new_sigma = sigma_sparse
-    if new_var is None:
-        new_var = var_sparse
-
-    log_p_new = log_joint(new_rgb, new_var, targets, new_sigma)
-    elbo = torch.where(log_p_new == -float("inf"), torch.zeros_like(q), log_p_new * q).sum() - torch.where(log_q == -float("inf"), torch.zeros_like(q), log_q * q).sum()
-    return q, log_q, elbo[None].detach()
-
-@torch.no_grad()
-def march_rays_calc_rgb_map(
-        viewdirs,
-        pts,
-        model,
-        valid_mask,
-        white_bkgd=False):
-    N_batch, N_samples, _ = pts.shape
-    sh_dim = model.args.sh_basis_dim
-    d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
-
-    coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
-    d = d.view(-1, sh_dim)[valid_mask.view(-1)]
-    bkgd_rgb = 1. if white_bkgd else 0.
-    inf = -float("inf")
-
-    bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
-
-    def create_sparse(tensor, shape, init, mask=valid_mask):
-        tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
-        tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
-        return tensor_sparse
-
-    rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
-    sigma = model.vox_sigma.calc_sigma(coords_xyz)
-
-    rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
-    rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
-    sigma_sparse = create_sparse(sigma, (N_batch , N_samples), inf)
-
-    rgb_map = calc_rgb_map(rgb_sparse, sigma_sparse)
-    rgb_map = rgb_map * model.target_std + model.target_mean
-    out = {
-        "rgb_map": rgb_map,
-    }
-
-    return out
+#     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+#     return rgb_map.detach()
 
 
-@torch.no_grad()
-def march_rays_update_tensors(
-        viewdirs,
-        pts,
-        model,
-        valid_mask,
-        dists,
-        targets,
-        update=None,
-        calc_elbo_for_new=None,
-        white_bkgd=False):
+# def log_joint(rgb, var, targets, sigma):
+#     log_passed = -torch.logaddexp(sigma, torch.zeros_like(sigma))
+#     log_not_passed = -torch.logaddexp(-sigma, torch.zeros_like(sigma))
+#     log_weights = log_integrate(log_passed, log_not_passed)
+
+#     log_var = torch.log(var)
+#     log_p = -1.5 * math.log(math.pi * 2) - 1.5 * log_var - 1. / (2 * var) * torch.sum((rgb - targets[:,None,:])**2, dim=2) + log_weights
+#     return log_p
+
+
+# @torch.no_grad()
+# def add_reg(elbo, model, new_tensor=False):
+#     return elbo + \
+#         torch.sum(model.vox_rgb.log_reg(new_tensor)) + \
+#         torch.sum(model.vox_var.log_gamma_reg(new_tensor)) + \
+#         torch.sum(model.vox_var.log_gamma_reg_bkgd(new_tensor)) + \
+#         torch.sum(model.vox_sigma.log_reg(new_tensor))
+
+# @torch.no_grad()
+# def calc_alphas(targets, rgb_sparse, sigma_sparse, var_sparse, new_rgb=None, new_sigma=None, new_var=None):
+#     log_p = log_joint(rgb_sparse, var_sparse, targets, sigma_sparse)
+
+#     q = torch.softmax(log_p, dim=1).detach()
+#     log_q = torch.log_softmax(log_p, dim=1).detach()
+
+#     if new_rgb is None:
+#         new_rgb = rgb_sparse
+#     if new_sigma is None:
+#         new_sigma = sigma_sparse
+#     if new_var is None:
+#         new_var = var_sparse
+
+#     log_p_new = log_joint(new_rgb, new_var, targets, new_sigma)
+#     elbo = torch.where(log_p_new == -float("inf"), torch.zeros_like(q), log_p_new * q).sum() - torch.where(log_q == -float("inf"), torch.zeros_like(q), log_q * q).sum()
+#     return q, log_q, elbo[None].detach()
+
+# @torch.no_grad()
+# def march_rays_calc_rgb_map(
+#         viewdirs,
+#         pts,
+#         model,
+#         valid_mask,
+#         white_bkgd=False):
+#     N_batch, N_samples, _ = pts.shape
+#     sh_dim = model.args.sh_basis_dim
+#     d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
+
+#     coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
+#     d = d.view(-1, sh_dim)[valid_mask.view(-1)]
+#     bkgd_rgb = 1. if white_bkgd else 0.
+#     inf = -float("inf")
+
+#     bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
+
+#     def create_sparse(tensor, shape, init, mask=valid_mask):
+#         tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
+#         tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
+#         return tensor_sparse
+
+#     rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
+#     sigma = model.vox_sigma.calc_sigma(coords_xyz)
+
+#     rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
+#     rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
+#     sigma_sparse = create_sparse(sigma, (N_batch , N_samples), inf)
+
+#     rgb_map = calc_rgb_map(rgb_sparse, sigma_sparse)
+#     rgb_map = rgb_map * model.target_std + model.target_mean
+#     out = {
+#         "rgb_map": rgb_map,
+#     }
+
+#     return out
+
+
+# @torch.no_grad()
+# def march_rays_update_tensors(
+#         viewdirs,
+#         pts,
+#         model,
+#         valid_mask,
+#         dists,
+#         targets,
+#         update=None,
+#         calc_elbo_for_new=None,
+#         white_bkgd=False):
     
 
-    N_batch, N_samples = dists.shape
-    sh_dim = model.args.sh_basis_dim
-    d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
+#     N_batch, N_samples = dists.shape
+#     sh_dim = model.args.sh_basis_dim
+#     d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
 
-    coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
-    d = d.view(-1, sh_dim)[valid_mask.view(-1)]
-    bkgd_rgb = 1. if white_bkgd else 0.
-    inf = -float("inf")
+#     coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
+#     d = d.view(-1, sh_dim)[valid_mask.view(-1)]
+#     bkgd_rgb = 1. if white_bkgd else 0.
+#     inf = -float("inf")
 
-    targets = (targets - model.target_mean) / model.target_std
-    bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
+#     targets = (targets - model.target_mean) / model.target_std
+#     bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
 
-    def create_sparse(tensor, shape, init, mask=valid_mask):
-        tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
-        tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
-        return tensor_sparse
+#     def create_sparse(tensor, shape, init, mask=valid_mask):
+#         tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
+#         tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
+#         return tensor_sparse
 
-    rgb_sparse_new, var_sparse_new, sigma_sparse_new = None, None, None
-    if "var" in update or "rgb" in calc_elbo_for_new:
-        rgb_new = model.vox_rgb.calc_rgb(coords_xyz, d, new_tensor=True)
-        rgb_sparse_new = create_sparse(rgb_new, (N_batch, N_samples, 3), 0)
-        rgb_sparse_new = F.pad(rgb_sparse_new, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
-    if "var" in calc_elbo_for_new:
-        var_new = model.vox_var.calc_var(coords_xyz, new_tensor=True)
-        var_bkgd_new = model.vox_var.calc_var_bkgd(new_tensor=True)
-        var_sparse_new = create_sparse(var_new, (N_batch , N_samples), 1)
-        var_sparse_new = torch.cat([var_sparse_new, var_bkgd_new.expand(N_batch, 1)], dim=1)
-    if "sigma" in calc_elbo_for_new:
-        sigma_new = model.vox_sigma.calc_sigma(coords_xyz, new_tensor=True)
-        sigma_sparse_new = create_sparse(sigma_new, (N_batch , N_samples), inf)
+#     rgb_sparse_new, var_sparse_new, sigma_sparse_new = None, None, None
+#     if "var" in update or "rgb" in calc_elbo_for_new:
+#         rgb_new = model.vox_rgb.calc_rgb(coords_xyz, d, new_tensor=True)
+#         rgb_sparse_new = create_sparse(rgb_new, (N_batch, N_samples, 3), 0)
+#         rgb_sparse_new = F.pad(rgb_sparse_new, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
+#     if "var" in calc_elbo_for_new:
+#         var_new = model.vox_var.calc_var(coords_xyz, new_tensor=True)
+#         var_bkgd_new = model.vox_var.calc_var_bkgd(new_tensor=True)
+#         var_sparse_new = create_sparse(var_new, (N_batch , N_samples), 1)
+#         var_sparse_new = torch.cat([var_sparse_new, var_bkgd_new.expand(N_batch, 1)], dim=1)
+#     if "sigma" in calc_elbo_for_new:
+#         sigma_new = model.vox_sigma.calc_sigma(coords_xyz, new_tensor=True)
+#         sigma_sparse_new = create_sparse(sigma_new, (N_batch , N_samples), inf)
 
-    rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
-    sigma = model.vox_sigma.calc_sigma(coords_xyz)
-    var = model.vox_var.calc_var(coords_xyz)
-    var_bkgd = model.vox_var.calc_var_bkgd()
+#     rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
+#     sigma = model.vox_sigma.calc_sigma(coords_xyz)
+#     var = model.vox_var.calc_var(coords_xyz)
+#     var_bkgd = model.vox_var.calc_var_bkgd()
 
-    rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
-    rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
-    sigma_sparse = create_sparse(sigma, (N_batch , N_samples), inf)
-    var_sparse = create_sparse(var, (N_batch , N_samples), 1)
-    var_sparse = torch.cat([var_sparse, var_bkgd.expand(N_batch, 1)], dim=1)
+#     rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
+#     rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
+#     sigma_sparse = create_sparse(sigma, (N_batch , N_samples), inf)
+#     var_sparse = create_sparse(var, (N_batch , N_samples), 1)
+#     var_sparse = torch.cat([var_sparse, var_bkgd.expand(N_batch, 1)], dim=1)
 
-    _,  log_alphas_sparsed, elbo = calc_alphas(targets, rgb_sparse, sigma_sparse, var_sparse, new_rgb=rgb_sparse_new, new_var=var_sparse_new, new_sigma=sigma_sparse_new)
-    rgb_map = calc_rgb_map(rgb_sparse, sigma_sparse)
-    rgb_map = rgb_map * model.target_std + model.target_mean
-    out = {
-        "elbo": elbo,
-        "rgb_map": rgb_map,
-    }
+#     _,  log_alphas_sparsed, elbo = calc_alphas(targets, rgb_sparse, sigma_sparse, var_sparse, new_rgb=rgb_sparse_new, new_var=var_sparse_new, new_sigma=sigma_sparse_new)
+#     rgb_map = calc_rgb_map(rgb_sparse, sigma_sparse)
+#     rgb_map = rgb_map * model.target_std + model.target_mean
+#     out = {
+#         "elbo": elbo,
+#         "rgb_map": rgb_map,
+#     }
 
-    log_alphas = log_alphas_sparsed[:,:-1].reshape(-1)[valid_mask.view(-1)]
-    x = targets[:,None,:].repeat(1, N_samples, 1).view(-1, 3)[valid_mask.view(-1)]
+#     log_alphas = log_alphas_sparsed[:,:-1].reshape(-1)[valid_mask.view(-1)]
+#     x = targets[:,None,:].repeat(1, N_samples, 1).view(-1, 3)[valid_mask.view(-1)]
 
-    if "rgb" in update:
-        model.vox_rgb.update_statistics(coords_xyz, log_alphas, d, x)
+#     if "rgb" in update:
+#         model.vox_rgb.update_statistics(coords_xyz, log_alphas, d, x)
 
-    if "sigma" in update:
-        log_alphas_sumed_sparsed = log_alphas_sparsed.flip(1).logcumsumexp(1).flip(1)
-        model.vox_sigma.update_statistics(coords_xyz, log_alphas_sumed_sparsed[:,1:].reshape(-1)[valid_mask.view(-1)], log_alphas)
+#     if "sigma" in update:
+#         log_alphas_sumed_sparsed = log_alphas_sparsed.flip(1).logcumsumexp(1).flip(1)
+#         model.vox_sigma.update_statistics(coords_xyz, log_alphas_sumed_sparsed[:,1:].reshape(-1)[valid_mask.view(-1)], log_alphas)
 
-    if "var" in update:
-        log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
-        errors = torch.sum((rgb_new - x)**2, dim=1) / 3
-        bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
+#     if "var" in update:
+#         log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
+#         errors = torch.sum((rgb_new - x)**2, dim=1) / 3
+#         bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
 
-        model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
-        model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
+#         model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
+#         model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
 
-    if "var_by_old_rgb" in update:
-        log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
-        errors = torch.sum((rgb - x)**2, dim=1) / 3
-        bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
+#     if "var_by_old_rgb" in update:
+#         log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
+#         errors = torch.sum((rgb - x)**2, dim=1) / 3
+#         bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
 
-        model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
-        model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
+#         model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
+#         model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
 
-    return out
+#     return out
 
-def log1mexp(a):
-    a_0 = math.log(2)
-    return torch.where(a < a_0, torch.log(-torch.expm1(-a)), torch.log1p(-torch.exp(-a)))
+# def log1mexp(a):
+#     a_0 = math.log(2)
+#     return torch.where(a < a_0, torch.log(-torch.expm1(-a)), torch.log1p(-torch.exp(-a)))
 
-def log_normal(rgb, var, targets):
-    return -1.5 * math.log(math.pi * 2) - 1.5 * torch.log(var) - 1. / (2 * var) * torch.sum((rgb - targets[:,None,:])**2, dim=2)
+# def log_normal(rgb, var, targets):
+#     return -1.5 * math.log(math.pi * 2) - 1.5 * torch.log(var) - 1. / (2 * var) * torch.sum((rgb - targets[:,None,:])**2, dim=2)
 
-def log_joint_with_exp(rgb, var, targets, sigma, dists):
-    log_passed = -sigma * dists
-    log_not_passed = -log1mexp(sigma * dists)
-    log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
-    cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
-    log_weights = log_not_passed + cum_log_att_exclusive
+# def log_joint_with_exp(rgb, var, targets, sigma, dists):
+#     log_passed = -sigma * dists
+#     log_not_passed = -log1mexp(sigma * dists)
+#     log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
+#     cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
+#     log_weights = log_not_passed + cum_log_att_exclusive
 
-    log_p = log_normal(rgb, var, targets) + log_weights
-    return log_p
-
-
-def log1m1divexpm1(x):
-    border = 1e-3
-    return torch.where(x >= border,
-        torch.log1p(-x / torch.expm1(x)),
-        torch.log(x / 2))
-
-@torch.no_grad()
-def calc_alphas_with_exp(targets, dists, rgb_sparse, sigma_sparse, var_sparse, new_rgb=None, new_sigma=None, new_var=None):
-    log_passed = -sigma_sparse * dists
-    log_not_passed = log1mexp(sigma_sparse * dists)
-    log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
-    cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
-    log_weights = log_not_passed + cum_log_att_exclusive
-
-    log_p = log_normal(rgb_sparse, var_sparse, targets) + log_weights
+#     log_p = log_normal(rgb, var, targets) + log_weights
+#     return log_p
 
 
-    log_q = torch.log_softmax(log_p, dim=1).detach()
-    # Ez_log = -torch.log(sigma_sparse) + log1mexp(log1mexp(sigma_sparse * dists) + sigma_sparse * dists - torch.log(sigma_sparse * dists))
-    Ez_log = -torch.log(sigma_sparse) + log1m1divexpm1(sigma_sparse * dists)
-    # Ez_log = torch.log(1 / sigma_sparse - dists / torch.expm1(sigma_sparse * dists))
-    log_Ez = log_q + Ez_log
+# def log1m1divexpm1(x):
+#     border = 1e-3
+#     return torch.where(x >= border,
+#         torch.log1p(-x / torch.expm1(x)),
+#         torch.log(x / 2))
 
-    elbo = torch.logsumexp(log_p, dim=1)
-    if new_rgb is not None or new_sigma is not None or new_var is not None:
-        if new_rgb is None:
-            new_rgb = rgb_sparse
-        if new_sigma is None:
-            new_sigma = sigma_sparse
-        if new_var is None:
-            new_var = var_sparse
+# @torch.no_grad()
+# def calc_alphas_with_exp(targets, dists, rgb_sparse, sigma_sparse, var_sparse, new_rgb=None, new_sigma=None, new_var=None):
+#     log_passed = -sigma_sparse * dists
+#     log_not_passed = log1mexp(sigma_sparse * dists)
+#     log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
+#     cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
+#     log_weights = log_not_passed + cum_log_att_exclusive
 
-        new_cum_log = torch.cumsum(F.pad((-new_sigma * dists)[:,:-1], (1, 0)), dim=1)
-        Ez_log_new= -torch.log(new_sigma) + log1m1divexpm1(sigma_sparse * dists)
-
-        new_log_p = (new_cum_log + torch.log(new_sigma) - new_sigma * torch.exp(Ez_log_new))
-        old_log_p = (cum_log_att_exclusive + torch.log(sigma_sparse) - sigma_sparse * torch.exp(Ez_log))
-
-        new_log_p = torch.where((new_log_p == -float("inf")) | new_log_p.isnan(), torch.zeros_like(new_log_p), new_log_p * log_q.exp()).sum()
-        old_log_p = torch.where((old_log_p == -float("inf")) | old_log_p.isnan(), torch.zeros_like(old_log_p), old_log_p * log_q.exp()).sum()
-
-        new2_elbo = torch.logsumexp(new_cum_log + log1mexp(new_sigma * dists) + log_normal(new_rgb, new_var, targets), dim=1)
-
-        # assert torch.all(new2_elbo >= elbo)
-
-        new_elbo = new_log_p - old_log_p + elbo.sum()
-        elbo = new_elbo
-
-    return log_q, log_Ez, elbo.sum()[None].detach()
-
-def calc_rgb_map_with_exp(rgb, sigma, dists):
-    log_passed = -sigma * dists
-    log_not_passed = log1mexp(sigma * dists)
-    log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
-    cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
-    log_weights = log_not_passed + cum_log_att_exclusive
-
-    weights = log_weights.exp()
-
-    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
-    return rgb_map.detach()
+#     log_p = log_normal(rgb_sparse, var_sparse, targets) + log_weights
 
 
-@torch.no_grad()
-def march_rays_calc_rgb_map_with_exp(
-        viewdirs,
-        pts,
-        dists,
-        model,
-        valid_mask,
-        white_bkgd=False):
-    N_batch, N_samples, _ = pts.shape
-    sh_dim = model.args.sh_basis_dim
-    d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
+#     log_q = torch.log_softmax(log_p, dim=1).detach()
+#     # Ez_log = -torch.log(sigma_sparse) + log1mexp(log1mexp(sigma_sparse * dists) + sigma_sparse * dists - torch.log(sigma_sparse * dists))
+#     Ez_log = -torch.log(sigma_sparse) + log1m1divexpm1(sigma_sparse * dists)
+#     # Ez_log = torch.log(1 / sigma_sparse - dists / torch.expm1(sigma_sparse * dists))
+#     log_Ez = log_q + Ez_log
 
-    coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
-    d = d.view(-1, sh_dim)[valid_mask.view(-1)]
-    bkgd_rgb = 1. if white_bkgd else 0.
-    inf = -float("inf")
+#     elbo = torch.logsumexp(log_p, dim=1)
+#     if new_rgb is not None or new_sigma is not None or new_var is not None:
+#         if new_rgb is None:
+#             new_rgb = rgb_sparse
+#         if new_sigma is None:
+#             new_sigma = sigma_sparse
+#         if new_var is None:
+#             new_var = var_sparse
 
-    bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
+#         new_cum_log = torch.cumsum(F.pad((-new_sigma * dists)[:,:-1], (1, 0)), dim=1)
+#         Ez_log_new= -torch.log(new_sigma) + log1m1divexpm1(sigma_sparse * dists)
 
-    def create_sparse(tensor, shape, init, mask=valid_mask):
-        tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
-        tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
-        return tensor_sparse
+#         new_log_p = (new_cum_log + torch.log(new_sigma) - new_sigma * torch.exp(Ez_log_new))
+#         old_log_p = (cum_log_att_exclusive + torch.log(sigma_sparse) - sigma_sparse * torch.exp(Ez_log))
 
-    rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
-    sigma = model.vox_sigma.calc_sigma(coords_xyz)
+#         new_log_p = torch.where((new_log_p == -float("inf")) | new_log_p.isnan(), torch.zeros_like(new_log_p), new_log_p * log_q.exp()).sum()
+#         old_log_p = torch.where((old_log_p == -float("inf")) | old_log_p.isnan(), torch.zeros_like(old_log_p), old_log_p * log_q.exp()).sum()
 
-    rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
-    rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
-    sigma_sparse = create_sparse(sigma, (N_batch , N_samples), 0)
-    sigma_sparse = F.pad(sigma_sparse, (0, 1), mode="constant", value=1)
-    dists = F.pad(dists, (0, 1), mode="constant", value=float("inf"))
+#         new2_elbo = torch.logsumexp(new_cum_log + log1mexp(new_sigma * dists) + log_normal(new_rgb, new_var, targets), dim=1)
 
-    rgb_map = calc_rgb_map_with_exp(rgb_sparse, sigma_sparse, dists)
-    rgb_map = rgb_map * model.target_std + model.target_mean
-    out = {
-        "rgb_map": rgb_map,
-    }
+#         # assert torch.all(new2_elbo >= elbo)
 
-    return out
+#         new_elbo = new_log_p - old_log_p + elbo.sum()
+#         elbo = new_elbo
+
+#     return log_q, log_Ez, elbo.sum()[None].detach()
+
+# def calc_rgb_map_with_exp(rgb, sigma, dists):
+#     log_passed = -sigma * dists
+#     log_not_passed = log1mexp(sigma * dists)
+#     log_passed = F.pad(log_passed[:, :-1], (1, 0))  # NR x NS (add column zeros left, remove column right)
+#     cum_log_att_exclusive = torch.cumsum(log_passed, dim=1)  # NR x NS
+#     log_weights = log_not_passed + cum_log_att_exclusive
+
+#     weights = log_weights.exp()
+
+#     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+#     return rgb_map.detach()
 
 
-@torch.no_grad()
-def march_rays_update_tensors_with_exp(
-        viewdirs,
-        pts,
-        model,
-        valid_mask,
-        dists,
-        targets,
-        update=None,
-        calc_elbo_for_new=None,
-        white_bkgd=False):
+# @torch.no_grad()
+# def march_rays_calc_rgb_map_with_exp(
+#         viewdirs,
+#         pts,
+#         dists,
+#         model,
+#         valid_mask,
+#         white_bkgd=False):
+#     N_batch, N_samples, _ = pts.shape
+#     sh_dim = model.args.sh_basis_dim
+#     d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
+
+#     coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
+#     d = d.view(-1, sh_dim)[valid_mask.view(-1)]
+#     bkgd_rgb = 1. if white_bkgd else 0.
+#     inf = -float("inf")
+
+#     bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
+
+#     def create_sparse(tensor, shape, init, mask=valid_mask):
+#         tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
+#         tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
+#         return tensor_sparse
+
+#     rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
+#     sigma = model.vox_sigma.calc_sigma(coords_xyz)
+
+#     rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
+#     rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
+#     sigma_sparse = create_sparse(sigma, (N_batch , N_samples), 0)
+#     sigma_sparse = F.pad(sigma_sparse, (0, 1), mode="constant", value=1)
+#     dists = F.pad(dists, (0, 1), mode="constant", value=float("inf"))
+
+#     rgb_map = calc_rgb_map_with_exp(rgb_sparse, sigma_sparse, dists)
+#     rgb_map = rgb_map * model.target_std + model.target_mean
+#     out = {
+#         "rgb_map": rgb_map,
+#     }
+
+#     return out
+
+
+# @torch.no_grad()
+# def march_rays_update_tensors_with_exp(
+#         viewdirs,
+#         pts,
+#         model,
+#         valid_mask,
+#         dists,
+#         targets,
+#         update=None,
+#         calc_elbo_for_new=None,
+#         white_bkgd=False):
     
 
-    N_batch, N_samples = dists.shape
-    sh_dim = model.args.sh_basis_dim
-    d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
+#     N_batch, N_samples = dists.shape
+#     sh_dim = model.args.sh_basis_dim
+#     d = spherical_harmonics_bases(model.args.sh_basis_dim, viewdirs).repeat(1, N_samples, 1)  # N_rays x N_samples x sh_dim
 
-    coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
-    d = d.view(-1, sh_dim)[valid_mask.view(-1)]
-    bkgd_rgb = 1. if white_bkgd else 0.
-    inf = -float("inf")
+#     coords_xyz = pts.view(-1, 3)[valid_mask.view(-1)]
+#     d = d.view(-1, sh_dim)[valid_mask.view(-1)]
+#     bkgd_rgb = 1. if white_bkgd else 0.
+#     inf = -float("inf")
 
-    targets = (targets - model.target_mean) / model.target_std
-    bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
+#     targets = (targets - model.target_mean) / model.target_std
+#     bkgd_rgb = (bkgd_rgb - model.target_mean) / model.target_std
 
-    def create_sparse(tensor, shape, init, mask=valid_mask):
-        tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
-        tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
-        return tensor_sparse
+#     def create_sparse(tensor, shape, init, mask=valid_mask):
+#         tensor_sparse = torch.full(shape, init, dtype=tensor.dtype, device=tensor.device)
+#         tensor_sparse.view(shape[0] * shape[1], -1)[mask.view(-1)] = tensor.view(tensor.shape[0], -1)
+#         return tensor_sparse
 
-    rgb_sparse_new, var_sparse_new, sigma_sparse_new = None, None, None
-    if "var" in update or "rgb" in calc_elbo_for_new:
-        rgb_new = model.vox_rgb.calc_rgb(coords_xyz, d, new_tensor=True)
-        rgb_sparse_new = create_sparse(rgb_new, (N_batch, N_samples, 3), 0)
-        rgb_sparse_new = F.pad(rgb_sparse_new, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
-    if "var" in calc_elbo_for_new:
-        var_new = model.vox_var.calc_var(coords_xyz, new_tensor=True)
-        var_bkgd_new = model.vox_var.calc_var_bkgd(new_tensor=True)
-        var_sparse_new = create_sparse(var_new, (N_batch , N_samples), 1)
-        var_sparse_new = torch.cat([var_sparse_new, var_bkgd_new.expand(N_batch, 1)], dim=1)
-    if "sigma" in calc_elbo_for_new:
-        sigma_new = model.vox_sigma.calc_sigma(coords_xyz, new_tensor=True)
-        sigma_sparse_new = create_sparse(sigma_new, (N_batch , N_samples), 0)
-        sigma_sparse_new = F.pad(sigma_sparse_new, (0, 1), mode="constant", value=1)
+#     rgb_sparse_new, var_sparse_new, sigma_sparse_new = None, None, None
+#     if "var" in update or "rgb" in calc_elbo_for_new:
+#         rgb_new = model.vox_rgb.calc_rgb(coords_xyz, d, new_tensor=True)
+#         rgb_sparse_new = create_sparse(rgb_new, (N_batch, N_samples, 3), 0)
+#         rgb_sparse_new = F.pad(rgb_sparse_new, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
+#     if "var" in calc_elbo_for_new:
+#         var_new = model.vox_var.calc_var(coords_xyz, new_tensor=True)
+#         var_bkgd_new = model.vox_var.calc_var_bkgd(new_tensor=True)
+#         var_sparse_new = create_sparse(var_new, (N_batch , N_samples), 1)
+#         var_sparse_new = torch.cat([var_sparse_new, var_bkgd_new.expand(N_batch, 1)], dim=1)
+#     if "sigma" in calc_elbo_for_new:
+#         sigma_new = model.vox_sigma.calc_sigma(coords_xyz, new_tensor=True)
+#         sigma_sparse_new = create_sparse(sigma_new, (N_batch , N_samples), 0)
+#         sigma_sparse_new = F.pad(sigma_sparse_new, (0, 1), mode="constant", value=1)
 
-    rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
-    sigma = model.vox_sigma.calc_sigma(coords_xyz)
-    var = model.vox_var.calc_var(coords_xyz)
-    var_bkgd = model.vox_var.calc_var_bkgd()
+#     rgb = model.vox_rgb.calc_rgb(coords_xyz, d)
+#     sigma = model.vox_sigma.calc_sigma(coords_xyz)
+#     var = model.vox_var.calc_var(coords_xyz)
+#     var_bkgd = model.vox_var.calc_var_bkgd()
 
-    rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
-    rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
-    sigma_sparse = create_sparse(sigma, (N_batch , N_samples), 0)
-    sigma_sparse = F.pad(sigma_sparse, (0, 1), mode="constant", value=1)
-    dists.view(-1)[valid_mask.view(-1).logical_not()] = 0
-    dists = F.pad(dists, (0, 1), mode="constant", value=float("inf"))
-    var_sparse = create_sparse(var, (N_batch , N_samples), 1)
-    var_sparse = torch.cat([var_sparse, var_bkgd.expand(N_batch, 1)], dim=1)
+#     rgb_sparse = create_sparse(rgb, (N_batch , N_samples, 3), 0)
+#     rgb_sparse = F.pad(rgb_sparse, (0, 0, 0, 1), mode="constant", value=bkgd_rgb)
+#     sigma_sparse = create_sparse(sigma, (N_batch , N_samples), 0)
+#     sigma_sparse = F.pad(sigma_sparse, (0, 1), mode="constant", value=1)
+#     dists.view(-1)[valid_mask.view(-1).logical_not()] = 0
+#     dists = F.pad(dists, (0, 1), mode="constant", value=float("inf"))
+#     var_sparse = create_sparse(var, (N_batch , N_samples), 1)
+#     var_sparse = torch.cat([var_sparse, var_bkgd.expand(N_batch, 1)], dim=1)
 
-    log_alphas_sparsed, log_betas_sparsed, elbo = calc_alphas_with_exp(targets, dists, rgb_sparse, sigma_sparse, var_sparse, new_rgb=rgb_sparse_new, new_var=var_sparse_new, new_sigma=sigma_sparse_new)
-    rgb_map = calc_rgb_map_with_exp(rgb_sparse, sigma_sparse, dists)
-    rgb_map = rgb_map * model.target_std + model.target_mean
-    out = {
-        "elbo": elbo,
-        "rgb_map": rgb_map,
-    }
+#     log_alphas_sparsed, log_betas_sparsed, elbo = calc_alphas_with_exp(targets, dists, rgb_sparse, sigma_sparse, var_sparse, new_rgb=rgb_sparse_new, new_var=var_sparse_new, new_sigma=sigma_sparse_new)
+#     rgb_map = calc_rgb_map_with_exp(rgb_sparse, sigma_sparse, dists)
+#     rgb_map = rgb_map * model.target_std + model.target_mean
+#     out = {
+#         "elbo": elbo,
+#         "rgb_map": rgb_map,
+#     }
 
-    log_alphas = log_alphas_sparsed[:,:-1].reshape(-1)[valid_mask.view(-1)]
-    x = targets[:,None,:].repeat(1, N_samples, 1).view(-1, 3)[valid_mask.view(-1)]
+#     log_alphas = log_alphas_sparsed[:,:-1].reshape(-1)[valid_mask.view(-1)]
+#     x = targets[:,None,:].repeat(1, N_samples, 1).view(-1, 3)[valid_mask.view(-1)]
 
-    if "rgb" in update:
-        model.vox_rgb.update_statistics(coords_xyz, log_alphas, d, x)
+#     if "rgb" in update:
+#         model.vox_rgb.update_statistics(coords_xyz, log_alphas, d, x)
 
-    if "sigma" in update:
-        log_alphas_sumed_sparsed = log_alphas_sparsed.flip(1).logcumsumexp(1).flip(1)
-        model.vox_sigma.update_statistics(
-            coords_xyz, log_alphas,
-            torch.logaddexp(log_alphas_sumed_sparsed[:,1:] + torch.log(dists[:,:-1]), log_betas_sparsed[:,:-1]).reshape(-1)[valid_mask.view(-1)],
-        )
+#     if "sigma" in update:
+#         log_alphas_sumed_sparsed = log_alphas_sparsed.flip(1).logcumsumexp(1).flip(1)
+#         model.vox_sigma.update_statistics(
+#             coords_xyz, log_alphas,
+#             torch.logaddexp(log_alphas_sumed_sparsed[:,1:] + torch.log(dists[:,:-1]), log_betas_sparsed[:,:-1]).reshape(-1)[valid_mask.view(-1)],
+#         )
 
-    if "var" in update:
-        log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
-        errors = torch.sum((rgb_new - x)**2, dim=1) / 3
-        bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
+#     if "var" in update:
+#         log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
+#         errors = torch.sum((rgb_new - x)**2, dim=1) / 3
+#         bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
 
-        model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
-        model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
+#         model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
+#         model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
 
-    if "var_by_old_rgb" in update:
-        log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
-        errors = torch.sum((rgb - x)**2, dim=1) / 3
-        bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
+#     if "var_by_old_rgb" in update:
+#         log_alphas_bkgd = log_alphas_sparsed[:,-1].reshape(-1)
+#         errors = torch.sum((rgb - x)**2, dim=1) / 3
+#         bkgd_errors = torch.sum((bkgd_rgb - targets)**2, dim=1) / 3
 
-        model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
-        model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
+#         model.vox_var.update_statistics(coords_xyz, log_alphas, errors)
+#         model.vox_var.update_bkgd_statistics(log_alphas_bkgd, bkgd_errors)
 
-    return out
+#     return out
 
 
 def render_rays(
@@ -710,62 +720,75 @@ def render_rays(
       raw: [num_rays, num_samples, 4]. Raw predictions from model.
     """
 
-    if use_EM > 0 and use_EM <= 3:
-        N_rays, device = ray_batch.shape[0], ray_batch.device
-        rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]
+    # if use_EM > 0 and use_EM <= 3:
+    #     N_rays, device = ray_batch.shape[0], ray_batch.device
+    #     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]
 
-        z_vals, dists, valid_mask = model.get_intersect_coords(rays_o, rays_d)
-        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    #     z_vals, dists, valid_mask = model.get_intersect_coords(rays_o, rays_d)
+    #     pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
-        if target_batch is None:
-            out = march_rays_calc_rgb_map(
-                rays_d,
-                pts,
-                model,
-                valid_mask,
-                white_bkgd=white_bkgd)
-        else:
-            out = march_rays_update_tensors(
-                rays_d,
-                pts,
-                model,
-                valid_mask,
-                dists,
-                target_batch,
-                calc_elbo_for_new=calc_elbo_for_new,
-                update=update_statistics,
-                white_bkgd=white_bkgd)
+    #     if target_batch is None:
+    #         out = march_rays_calc_rgb_map(
+    #             rays_d,
+    #             pts,
+    #             model,
+    #             valid_mask,
+    #             white_bkgd=white_bkgd)
+    #     else:
+    #         out = march_rays_update_tensors(
+    #             rays_d,
+    #             pts,
+    #             model,
+    #             valid_mask,
+    #             dists,
+    #             target_batch,
+    #             calc_elbo_for_new=calc_elbo_for_new,
+    #             update=update_statistics,
+    #             white_bkgd=white_bkgd)
             
-        return out
-    if use_EM >= 4:
-        N_rays, device = ray_batch.shape[0], ray_batch.device
-        rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]
+    #     return out
+    # if use_EM >= 4:
+    #     N_rays, device = ray_batch.shape[0], ray_batch.device
+    #     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]
 
-        z_vals, dists, valid_mask = model.get_intersect_coords(rays_o, rays_d)
-        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    #     z_vals, dists, valid_mask = model.get_intersect_coords(rays_o, rays_d)
+    #     pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
-        if target_batch is None:
-            out = march_rays_calc_rgb_map_with_exp(
-                rays_d,
-                pts,
-                dists,
-                model,
-                valid_mask,
-                white_bkgd=white_bkgd)
-        else:
-            out = march_rays_update_tensors_with_exp(
-                rays_d,
-                pts,
-                model,
-                valid_mask,
-                dists,
-                target_batch,
-                calc_elbo_for_new=calc_elbo_for_new,
-                update=update_statistics,
-                white_bkgd=white_bkgd)
+    #     if target_batch is None:
+    #         out = march_rays_calc_rgb_map_with_exp(
+    #             rays_d,
+    #             pts,
+    #             dists,
+    #             model,
+    #             valid_mask,
+    #             white_bkgd=white_bkgd)
+    #     else:
+    #         out = march_rays_update_tensors_with_exp(
+    #             rays_d,
+    #             pts,
+    #             model,
+    #             valid_mask,
+    #             dists,
+    #             target_batch,
+    #             calc_elbo_for_new=calc_elbo_for_new,
+    #             update=update_statistics,
+    #             white_bkgd=white_bkgd)
             
-        return out
+    #     return out
 
+    if use_new_march_rays:
+        rgb_map, weights = model.render_rays(ray_batch, N_samples, cur_step=cur_step)
+        out = {'rgb_map': rgb_map.detach()}
+
+        if target_batch is not None:
+            img_loss = {
+                'huber': F.huber_loss,
+                'mse': F.mse_loss,
+            }[lossfn](rgb_map, target_batch)
+            img_loss.backward()
+
+            out['losses'] = img_loss[None].detach()
+        return out
 
 
     def sample_rays(inputs, viewdirs):
@@ -820,7 +843,7 @@ def render_rays(
         pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
     # print(torch.floor((pts + 1) / 2 * dim_grid).long()[:10])
-    
+
     raw_rgb, raw_sigma, raw_var, mask = sample_rays(pts, viewdirs)
     if valid_mask is None:
         valid_mask = mask
@@ -886,7 +909,10 @@ def render_rays(
 
 def render_rays_chunks(rays_flat, chunk, targets, **kwargs):
     all_ret = {}
-    for i in trange(0, rays_flat.shape[0], chunk):
+    if chunk >= rays_flat.shape[0]:
+        return render_rays(rays_flat, targets, **kwargs)
+
+    for i in trange(0, rays_flat.shape[0], chunk, disable=True):
         target_batch = targets[i:i+chunk] if targets is not None else None
         ret = render_rays(rays_flat[i:i + chunk], target_batch, **kwargs)
         for k in ret:
@@ -1068,7 +1094,7 @@ def config_parser():
     parser.add_argument("--dist_constant", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--use_new_march_rays", type=int, default=0)
-    parser.add_argument("--sample_points", type=str, default='equal', choices=('equal', 'adjusted', 'grid'))
+    parser.add_argument("--sample_points", type=str, default='adjusted', choices=('equal', 'adjusted', 'grid'))
     parser.add_argument("--use_EM", type=int, default=0)
     parser.add_argument("--normalize", type=int, default=0)
     parser.add_argument("--intersect_threshold", type=float, default=1e-2)
@@ -1137,6 +1163,10 @@ def config_parser():
     parser.add_argument("--momentum", type=float, default=0)
     parser.add_argument("--lbfgs_iters", type=int, default=20,
                         help='iterations in lbfgs')
+    parser.add_argument("--weight_threshold", type=float, default=None)
+    parser.add_argument("--use_lrate_decay", type=int, default=True)
+    parser.add_argument("--history_size", type=int, default=10)
+    parser.add_argument("--clear_cache", type=int, default=0)
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64,
@@ -1208,6 +1238,8 @@ def config_parser():
 
 
 def train():
+    torch.autograd.set_detect_anomaly(True)
+
     parser = config_parser()
     args, extras = parser.parse_known_args()
     if len(extras) > 0:
@@ -1414,178 +1446,180 @@ def train():
         else:
             batch_rays = [rays_o, rays_d]
 
-        if args.use_EM != 0:
-            if args.use_EM == 1:
-                with torch.no_grad():
-                    model.vox_rgb.zeros_statistics()
-                    model.vox_sigma.zeros_statistics()
-                    model.vox_var.zeros_statistics()
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=['rgb'],
-                        calc_elbo_for_new=[],
-                        **render_kwargs_train,
-                    )
-                    model.vox_rgb.calc_new_tensor(model.vox_var.contract().squeeze())
-                    print("ELBO after Q:", add_reg(out["elbo"].sum(), model).item())
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=['var'],
-                        calc_elbo_for_new=['rgb'],
-                        **render_kwargs_train,
-                    )
-                    model.vox_var.calc_new_tensor()
-                    print("ELBO after rgb:", add_reg(out["elbo"].sum(), model).item())
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=['sigma'],
-                        calc_elbo_for_new=['rgb', 'var'],
-                        **render_kwargs_train,
-                    )
-                    model.vox_sigma.calc_new_tensor()
-                    print("ELBO after var:", add_reg(out["elbo"].sum(), model).item())
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=[],
-                        calc_elbo_for_new=['rgb', 'var', 'sigma'],
-                        **render_kwargs_train,
-                    )
-                    print("ELBO after sigma:", add_reg(out["elbo"].sum(), model).item())
-                    model.vox_rgb.update_old_tensor()
-                    model.vox_sigma.update_old_tensor()
-                    model.vox_var.update_old_tensor()
-            elif args.use_EM == 2 or args.use_EM == 5:
-                with torch.no_grad():
-                    model.vox_rgb.zeros_statistics()
-                    model.vox_sigma.zeros_statistics()
-                    model.vox_var.zeros_statistics()
-                    print("kek")
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=['rgb'],
-                        calc_elbo_for_new=[],
-                        **render_kwargs_train,
-                    )
-                    model.vox_rgb.calc_new_tensor(model.vox_var.contract().squeeze())
-                    model.vox_rgb.update_old_tensor()
-                    print("ELBO after sigma:", add_reg(out["elbo"].sum(), model).item())
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=['var_by_old_rgb'],
-                        calc_elbo_for_new=[],
-                        **render_kwargs_train,
-                    )
-                    print("ELBO after rgb:", add_reg(out["elbo"].sum(), model).item())
-                    model.vox_var.calc_new_tensor()
-                    model.vox_var.update_old_tensor()
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=['sigma'],
-                        calc_elbo_for_new=[],
-                        **render_kwargs_train,
-                    )
-                    model.vox_sigma.calc_new_tensor()
-                    print(add_reg(out["elbo"].sum(), model).item())
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=[],
-                        calc_elbo_for_new=['sigma'],
-                        **render_kwargs_train,
-                    )
-                    model.vox_sigma.update_old_tensor()
-                    print("ELBO after var:", add_reg(out["elbo"].sum(), model).item())
-                    out["elbo"] = add_reg(out["elbo"].sum(), model)
-            elif args.use_EM == 3 or args.use_EM == 4:
-                with torch.no_grad():
-                    model.vox_rgb.zeros_statistics()
-                    model.vox_sigma.zeros_statistics()
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=['rgb', 'sigma'],
-                        calc_elbo_for_new=[],
-                        **render_kwargs_train,
-                    )
-                    # model.vox_rgb.calc_new_tensor(model.vox_var.contract().squeeze())
-                    # model.vox_rgb.update_old_tensor()
-                    # model.vox_sigma.calc_new_tensor()
-                    # model.vox_sigma.update_old_tensor()
-                    model.vox_rgb.update_tensor(model.vox_var.contract().squeeze())
-                    model.vox_sigma.update_tensor()
-                    print("ELBO after var:", add_reg(out["elbo"].sum(), model).item())
-                    model.vox_sigma.zeros_statistics()
-                    model.vox_var.zeros_statistics()
-                    out = render(
-                        H, W, K,
-                        chunk=args.chunk,
-                        rays=batch_rays,
-                        targets=target,
-                        cur_step=i,
-                        update_statistics=['var_by_old_rgb', 'sigma'],
-                        calc_elbo_for_new=[],
-                        **render_kwargs_train,
-                    )
-                    print("ELBO after rgb:", add_reg(out["elbo"].sum(), model).item())
-                    out["elbo"] = add_reg(out["elbo"].sum(), model)
-                    # model.vox_var.calc_new_tensor()
-                    # model.vox_var.update_old_tensor()
-                    # model.vox_sigma.calc_new_tensor()
-                    # model.vox_sigma.update_old_tensor()
-                    model.vox_var.update_tensor()
-                    model.vox_sigma.update_tensor()
+        # if args.use_EM != 0:
+        #     if args.use_EM == 1:
+        #         with torch.no_grad():
+        #             model.vox_rgb.zeros_statistics()
+        #             model.vox_sigma.zeros_statistics()
+        #             model.vox_var.zeros_statistics()
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=['rgb'],
+        #                 calc_elbo_for_new=[],
+        #                 **render_kwargs_train,
+        #             )
+        #             model.vox_rgb.calc_new_tensor(model.vox_var.contract().squeeze())
+        #             print("ELBO after Q:", add_reg(out["elbo"].sum(), model).item())
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=['var'],
+        #                 calc_elbo_for_new=['rgb'],
+        #                 **render_kwargs_train,
+        #             )
+        #             model.vox_var.calc_new_tensor()
+        #             print("ELBO after rgb:", add_reg(out["elbo"].sum(), model).item())
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=['sigma'],
+        #                 calc_elbo_for_new=['rgb', 'var'],
+        #                 **render_kwargs_train,
+        #             )
+        #             model.vox_sigma.calc_new_tensor()
+        #             print("ELBO after var:", add_reg(out["elbo"].sum(), model).item())
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=[],
+        #                 calc_elbo_for_new=['rgb', 'var', 'sigma'],
+        #                 **render_kwargs_train,
+        #             )
+        #             print("ELBO after sigma:", add_reg(out["elbo"].sum(), model).item())
+        #             model.vox_rgb.update_old_tensor()
+        #             model.vox_sigma.update_old_tensor()
+        #             model.vox_var.update_old_tensor()
+        #     elif args.use_EM == 2 or args.use_EM == 5:
+        #         with torch.no_grad():
+        #             model.vox_rgb.zeros_statistics()
+        #             model.vox_sigma.zeros_statistics()
+        #             model.vox_var.zeros_statistics()
+        #             print("kek")
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=['rgb'],
+        #                 calc_elbo_for_new=[],
+        #                 **render_kwargs_train,
+        #             )
+        #             model.vox_rgb.calc_new_tensor(model.vox_var.contract().squeeze())
+        #             model.vox_rgb.update_old_tensor()
+        #             print("ELBO after sigma:", add_reg(out["elbo"].sum(), model).item())
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=['var_by_old_rgb'],
+        #                 calc_elbo_for_new=[],
+        #                 **render_kwargs_train,
+        #             )
+        #             print("ELBO after rgb:", add_reg(out["elbo"].sum(), model).item())
+        #             model.vox_var.calc_new_tensor()
+        #             model.vox_var.update_old_tensor()
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=['sigma'],
+        #                 calc_elbo_for_new=[],
+        #                 **render_kwargs_train,
+        #             )
+        #             model.vox_sigma.calc_new_tensor()
+        #             print(add_reg(out["elbo"].sum(), model).item())
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=[],
+        #                 calc_elbo_for_new=['sigma'],
+        #                 **render_kwargs_train,
+        #             )
+        #             model.vox_sigma.update_old_tensor()
+        #             print("ELBO after var:", add_reg(out["elbo"].sum(), model).item())
+        #             out["elbo"] = add_reg(out["elbo"].sum(), model)
+        #     elif args.use_EM == 3 or args.use_EM == 4:
+        #         with torch.no_grad():
+        #             model.vox_rgb.zeros_statistics()
+        #             model.vox_sigma.zeros_statistics()
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=['rgb', 'sigma'],
+        #                 calc_elbo_for_new=[],
+        #                 **render_kwargs_train,
+        #             )
+        #             # model.vox_rgb.calc_new_tensor(model.vox_var.contract().squeeze())
+        #             # model.vox_rgb.update_old_tensor()
+        #             # model.vox_sigma.calc_new_tensor()
+        #             # model.vox_sigma.update_old_tensor()
+        #             model.vox_rgb.update_tensor(model.vox_var.contract().squeeze())
+        #             model.vox_sigma.update_tensor()
+        #             print("ELBO after var:", add_reg(out["elbo"].sum(), model).item())
+        #             model.vox_sigma.zeros_statistics()
+        #             model.vox_var.zeros_statistics()
+        #             out = render(
+        #                 H, W, K,
+        #                 chunk=args.chunk,
+        #                 rays=batch_rays,
+        #                 targets=target,
+        #                 cur_step=i,
+        #                 update_statistics=['var_by_old_rgb', 'sigma'],
+        #                 calc_elbo_for_new=[],
+        #                 **render_kwargs_train,
+        #             )
+        #             print("ELBO after rgb:", add_reg(out["elbo"].sum(), model).item())
+        #             out["elbo"] = add_reg(out["elbo"].sum(), model)
+        #             # model.vox_var.calc_new_tensor()
+        #             # model.vox_var.update_old_tensor()
+        #             # model.vox_sigma.calc_new_tensor()
+        #             # model.vox_sigma.update_old_tensor()
+        #             model.vox_var.update_tensor()
+        #             model.vox_sigma.update_tensor()
 
 
 
-            mse_loss = F.mse_loss(out['rgb_map'], target).detach().cpu()
-            if i % args.i_print == 0:
-                psnr = mse2psnr(mse_loss)
-                val = {
-                    "iter": i,
-                    "mse_loss": mse_loss.item(),
-                    "psrn": psnr.item(),
-                }
-                if "elbo" in out:
-                    print("ELBO: ", out["elbo"])
-                    val["elbo"] = out["elbo"]
-                msg = f"[TRAIN] Iter: {i} of {args.N_iters}, loss: {mse_loss.item()}"
-                msg += f', PSNR: {psnr.item()}'
-                wandb.log(val, step=i)
-                print(msg)
+        #     mse_loss = F.mse_loss(out['rgb_map'], target).detach().cpu()
+        #     if i % args.i_print == 0:
+        #         psnr = mse2psnr(mse_loss)
+        #         val = {
+        #             "iter": i,
+        #             "mse_loss": mse_loss.item(),
+        #             "psrn": psnr.item(),
+        #         }
+        #         if "elbo" in out:
+        #             print("ELBO: ", out["elbo"])
+        #             val["elbo"] = out["elbo"]
+        #         msg = f"[TRAIN] Iter: {i} of {args.N_iters}, loss: {mse_loss.item()}"
+        #         msg += f', PSNR: {psnr.item()}'
+        #         wandb.log(val, step=i)
+        #         print(msg)
+        if False:
+            pass
         else:
             mse_loss = None
             loss = None
@@ -1607,13 +1641,12 @@ def train():
                     **render_kwargs_train
                 )
 
-                nonlocal mse_loss
-                nonlocal loss
-                mse_loss = F.mse_loss(out['rgb_map'], target).detach().cpu()
-                loss = out['losses'].mean().detach().cpu()
-                
-
                 if j % args.i_print == 0:
+                    nonlocal mse_loss
+                    nonlocal loss
+                    mse_loss = F.mse_loss(out['rgb_map'], target).detach().cpu()
+                    loss = out['losses'].mean().detach().cpu()
+
                     psnr = mse2psnr(mse_loss)
                     val = {
                         "iter": j,
@@ -1629,15 +1662,17 @@ def train():
                     wandb.log(val, step=j)
                     print(msg)
 
-                return loss
+                return out['losses'].sum().item()
 
             if args.optimizer in {"LBFGS", "SeparatedLBFGS"}:
                 optimizer.step(closure)
             else:
                 closure()
                 optimizer.step()
+            if args.clear_cache:
+                torch.cuda.empty_cache()
         
-            if args.optimizer != "LBFGS" and args.optimizer != "SeparatedLBFGS":
+            if args.use_lrate_decay:
                 decay_rate = 0.1
                 new_lrate = args.lrate * (decay_rate ** (global_step / args.lrate_decay))
                 if args.lrate_warmup_steps > 0 and global_step < args.lrate_warmup_steps:
@@ -1689,10 +1724,10 @@ def train():
                 torch.Tensor(poses[i_test]), hwf, K, args.chunk, render_kwargs_test,
                 gt_imgs=images[i_test], savedir=testsavedir, compute_stats=True, desc='test set', device=args.device
             )
-            _, train_psnr, train_mse, train_ssim, train_lpips = render_path(
-                torch.Tensor(poses[i_train]), hwf, K, args.chunk, render_kwargs_train,
-                gt_imgs=images[i_train], savedir=trainsavedir, compute_stats=True, desc='train set', device=args.device
-            )
+            # _, train_psnr, train_mse, train_ssim, train_lpips = render_path(
+            #     torch.Tensor(poses[i_train]), hwf, K, args.chunk, render_kwargs_train,
+            #     gt_imgs=images[i_train], savedir=trainsavedir, compute_stats=True, desc='train set', device=args.device
+            # )
             model.train()
 
             wandb.log({
@@ -1702,12 +1737,12 @@ def train():
                 'test_lpips': test_lpips,
             }, step=i)
 
-            wandb.log({
-                'train_mse': train_mse,
-                'train_psnr': train_psnr,
-                'train_ssim': train_ssim,
-                'train_lpips': train_lpips,
-            }, step=i)
+            # wandb.log({
+            #     'train_mse': train_mse,
+            #     'train_psnr': train_psnr,
+            #     'train_ssim': train_ssim,
+            #     'train_lpips': train_lpips,
+            # }, step=i)
 
             # tb_add_scalars(tb, 'test', {
             #     'mse': test_mse,
@@ -1717,7 +1752,7 @@ def train():
             # }, global_step=i)
 
             tqdm.write(f"[TEST] Iter: {i} of {args.N_iters}, PSNR: {test_psnr}, SSIM: {test_ssim}, LPIPS: {test_lpips}")
-            tqdm.write(f"[TRAIN] Iter: {i} of {args.N_iters}, PSNR: {train_psnr}, SSIM: {train_ssim}, LPIPS: {train_lpips}")
+            # tqdm.write(f"[TRAIN] Iter: {i} of {args.N_iters}, PSNR: {train_psnr}, SSIM: {train_ssim}, LPIPS: {train_lpips}")
 
         global_step += 1
 
