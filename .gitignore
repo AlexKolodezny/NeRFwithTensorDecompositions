@@ -131,3 +131,4 @@ dmypy.json
 data
 log
 wandb
+text_log
