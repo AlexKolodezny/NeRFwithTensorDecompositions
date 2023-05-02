@@ -1,12 +1,13 @@
-expname = vttmnf_grid_512
-dataset_dir = lego
+expname = vttmnf_ship
+dataset_dir = ship
 dataset_type = blender
 dataset_root = data
 log_root = log
 
 white_bkgd = True
 
-device=cuda:0
+device=cuda:2
+seed = 2023
 
 lrate = 3e-3
 lrate_decay = 80000
@@ -24,13 +25,14 @@ i_wandb=0
 
 lossfn = mse
 
+testskip = 1
 image_downscale_factor = 1
 image_downscale_filter = antialias
 scene_scale = 0.8
 
-dim_grid = 512
+dim_grid = 256
 
-models = '{"rgb": {"model": "VTTMNF","cp_rank": 64, "tt_rank": 48, "return_mask": 1, "scale": 0.1}}'
-sigma_warmup_sts=0
+models = '{"rgb": {"model": "VTTMNF", "cp_rank": 48, "tt_rank": 48, "return_mask": 1, "scale": 0.1}}'
+sigma_warmup_sts=1
 dtype = float32
 checks = 0

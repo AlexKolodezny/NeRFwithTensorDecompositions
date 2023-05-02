@@ -91,7 +91,7 @@ class VTTMNF(BaseNF):
             F.grid_sample(
                 F.pad(matrix, (0, 1, 0, 1), mode='circular'),
                 younger_xyz[None,:,None,[y,z]].detach(),
-                align_corners=True, mode='bilinear').squeeze().T
+                align_corners=True, mode='bilinear').view(-1, num_samples).T
             for (x, y, z), matrix in zip([(0, 1, 2), (1, 0, 2), (2, 0, 1)], self.younger_matrices)
         ]
 
@@ -114,7 +114,10 @@ class VTTMNF(BaseNF):
             for (x, y, z), vector in zip([(0, 1, 2), (1, 0, 2), (2, 0, 1)], self.vectors)
         ], dim=0).T
 
-        return self.B(M * V)
+        if self.output_features != 1:
+            return self.B(M * V)
+        else:
+            return (M * V).sum(dim=1)
 
     def contract(self):
         return torch.einsum(

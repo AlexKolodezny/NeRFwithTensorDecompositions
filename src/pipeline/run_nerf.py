@@ -12,6 +12,7 @@ import time
 
 from .helpers import *
 from .load_blender import load_blender_data
+from .load_tnt import load_tnt_data
 from .radiance_field import RadianceField
 from ..models.spherical_harmonics import spherical_harmonics_bases
 
@@ -102,6 +103,7 @@ def create_model(args):
         'use_new_march_rays': args.use_new_march_rays,
         'sample_points': args.sample_points,
         'use_EM': args.use_EM,
+        'perturb_direction': args.perturb_direction,
     }
 
     print('Not ndc!')
@@ -109,6 +111,7 @@ def create_model(args):
 
     render_kwargs_test = {k: render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = 0
+    render_kwargs_test['perturb_direction'] = 0
     render_kwargs_test['raw_noise_std'] = 0.
 
     return model, render_kwargs_train, render_kwargs_test, optimizers
@@ -671,6 +674,105 @@ def march_rays(
 
 #     return out
 
+def lift_gaussian(d, t_mean, t_var, r_var, diag):
+  """Lift a Gaussian defined along a ray to 3D coordinates."""
+  mean = d[..., None, :] * t_mean[..., None]
+
+  d_mag_sq = torch.maximum(1e-10, torch.sum(d**2, dim=-1, keepdims=True))
+
+  if diag:
+    d_outer_diag = d**2
+    null_outer_diag = 1 - d_outer_diag / d_mag_sq
+    t_cov_diag = t_var[..., None] * d_outer_diag[..., None, :]
+    xy_cov_diag = r_var[..., None] * null_outer_diag[..., None, :]
+    cov_diag = t_cov_diag + xy_cov_diag
+    return mean, cov_diag
+  else:
+    d_outer = d[..., :, None] * d[..., None, :]
+    eye = torch.eye(d.shape[-1])
+    null_outer = eye - d[..., :, None] * (d / d_mag_sq)[..., None, :]
+    t_cov = t_var[..., None, None] * d_outer[..., None, :, :]
+    xy_cov = r_var[..., None, None] * null_outer[..., None, :, :]
+    cov = t_cov + xy_cov
+    return mean, cov
+
+
+def conical_frustum_to_gaussian(d, t0, t1, base_radius, diag, stable=True):
+  """Approximate a conical frustum as a Gaussian distribution (mean+cov).
+  Assumes the ray is originating from the origin, and base_radius is the
+  radius at dist=1. Doesn't assume `d` is normalized.
+  Args:
+    d: torch.float32 3-vector, the axis of the cone
+    t0: float, the starting distance of the frustum.
+    t1: float, the ending distance of the frustum.
+    base_radius: float, the scale of the radius as a function of distance.
+    diag: boolean, whether or the Gaussian will be diagonal or full-covariance.
+    stable: boolean, whether or not to use the stable computation described in
+      the paper (setting this to False will cause catastrophic failure).
+  Returns:
+    a Gaussian (mean and covariance).
+  """
+  if stable:
+    # Equation 7 in the paper (https://arxiv.org/abs/2103.13415).
+    mu = (t0 + t1) / 2  # The average of the two `t` values.
+    hw = (t1 - t0) / 2  # The half-width of the two `t` values.
+    eps = torch.finfo(torch.float32).eps
+    t_mean = mu + (2 * mu * hw**2) / torch.maximum(eps, 3 * mu**2 + hw**2)
+    denom = torch.maximum(eps, 3 * mu**2 + hw**2)
+    t_var = (hw**2) / 3 - (4 / 15) * hw**4 * (12 * mu**2 - hw**2) / denom**2
+    r_var = (mu**2) / 4 + (5 / 12) * hw**2 - (4 / 15) * (hw**4) / denom
+  else:
+    # Equations 37-39 in the paper.
+    t_mean = (3 * (t1**4 - t0**4)) / (4 * (t1**3 - t0**3))
+    r_var = 3 / 20 * (t1**5 - t0**5) / (t1**3 - t0**3)
+    t_mosq = 3 / 5 * (t1**5 - t0**5) / (t1**3 - t0**3)
+    t_var = t_mosq - t_mean**2
+  r_var *= base_radius**2
+  return lift_gaussian(d, t_mean, t_var, r_var, diag)
+
+
+def cylinder_to_gaussian(d, t0, t1, radius, diag):
+  """Approximate a cylinder as a Gaussian distribution (mean+cov).
+  Assumes the ray is originating from the origin, and radius is the
+  radius. Does not renormalize `d`.
+  Args:
+    d: torch.float32 3-vector, the axis of the cylinder
+    t0: float, the starting distance of the cylinder.
+    t1: float, the ending distance of the cylinder.
+    radius: float, the radius of the cylinder
+    diag: boolean, whether or the Gaussian will be diagonal or full-covariance.
+  Returns:
+    a Gaussian (mean and covariance).
+  """
+  t_mean = (t0 + t1) / 2
+  r_var = radius**2 / 4
+  t_var = (t1 - t0)**2 / 12
+  return lift_gaussian(d, t_mean, t_var, r_var, diag)
+
+
+def cast_rays(tdist, origins, directions, radii, ray_shape, diag=True):
+  """Cast rays (cone- or cylinder-shaped) and featurize sections of it.
+  Args:
+    tdist: float array, the "fencepost" distances along the ray.
+    origins: float array, the ray origin coordinates.
+    directions: float array, the ray direction vectors.
+    radii: float array, the radii (base radii for cones) of the rays.
+    ray_shape: string, the shape of the ray, must be 'cone' or 'cylinder'.
+    diag: boolean, whether or not the covariance matrices should be diagonal.
+  Returns:
+    a tuple of arrays of means and covariances.
+  """
+  t0 = tdist[..., :-1]
+  t1 = tdist[..., 1:]
+  if ray_shape == 'cone':
+    gaussian_fn = conical_frustum_to_gaussian
+  elif ray_shape == 'cylinder':
+    gaussian_fn = cylinder_to_gaussian
+  else:
+    raise ValueError('ray_shape must be \'cone\' or \'cylinder\'')
+  means, covs = gaussian_fn(directions, t0, t1, radii, diag)
+  means = means + origins[..., None, :]
+  return means, covs
 
 def render_rays(
         ray_batch,
@@ -682,6 +784,7 @@ def render_rays(
         use_viewdirs=False,
         dim_grid=None,
         perturb=0,
+        perturb_direction=0,
         N_importance=0,
         white_bkgd=False,
         raw_noise_std=0.,
@@ -805,6 +908,16 @@ def render_rays(
     N_rays, device = ray_batch.shape[0], ray_batch.device
     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]
     near, far = ray_batch[:, 6:7], ray_batch[:, 7:8]
+    radii = ray_batch[:,8:9]
+    rays_d_unnorm = ray_batch[:,9:12]
+    rays_dx = ray_batch[:,12:15]
+    rays_dy = ray_batch[:,15:18]
+
+    if perturb_direction:
+        alpha = torch.normal(torch.zeros(N_rays, 2, device=device), 0.5 / 12**0.5)
+        rays_d_unnorm = alpha[:,:1] * rays_dx + alpha[:,1:] * rays_dy + rays_d_unnorm
+        rays_d = rays_d_unnorm / rays_d_unnorm.norm(dim=1)[:,None]
+
     viewdirs = None
     if use_viewdirs:
         viewdirs = rays_d.clone()
@@ -957,15 +1070,15 @@ def render(
     near_vec, far_vec, valid_mask = None, None, None
     if c2w is not None:
         # special case to render full image
-        rays_o, rays_d, near_vec, far_vec, valid_mask = get_rays(
+        rays_o, rays_d, near_vec, far_vec, valid_mask, radii, rays_d_unnorm, rays_dx, rays_dy = get_rays(
             H, W, K, c2w, dir_center_pix=dir_center_pix, valid_only=filter_rays
         )
     else:
         # use provided ray batch
-        if len(rays) == 2:
-            rays_o, rays_d = rays
+        if len(rays) == 4:
+            rays_o, rays_d, radii, rays_d_unnorm, rays_dx, rays_dy = rays
         else:
-            rays_o, rays_d, near_vec, far_vec = rays
+            rays_o, rays_d, near_vec, far_vec, radii, rays_d_unnorm, rays_dx, rays_dy = rays
 
     if adjust_near_far:
         near, far = near_vec, far_vec
@@ -976,7 +1089,7 @@ def render(
         # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    rays = torch.cat([rays_o, rays_d, near, far, radii[:,None], rays_d_unnorm, rays_dx, rays_dy], -1)
 
     # Render
     all_ret = render_rays_chunks(
@@ -1099,6 +1212,7 @@ def config_parser():
     parser.add_argument("--normalize", type=int, default=0)
     parser.add_argument("--intersect_threshold", type=float, default=1e-2)
     parser.add_argument("--repeat", type=int, default=0)
+    parser.add_argument("--perturb_direction", type=int, default=0)
     
     # Tacker voxel configuration
     parser.add_argument("--tacker_rank", type=int, default=64,
@@ -1273,6 +1387,7 @@ def train():
     # Load data
     dataset_path = os.path.join(args.dataset_root, {
         'blender': 'nerf_synthetic',
+        'tnt': 'tanks_and_temples',
     }[args.dataset_type], args.dataset_dir)
     K = None
     if args.dataset_type == 'blender':
@@ -1285,6 +1400,7 @@ def train():
             args.scene_rot_z_deg,
         )
         print('Loaded blender', images.shape, render_poses.shape, hwf, dataset_path)
+
         i_train, i_val, i_test = i_split
 
         near = 2.
@@ -1294,6 +1410,21 @@ def train():
             images = images[..., :3] * images[..., -1:] + (1. - images[..., -1:])
         else:
             images = images[..., :3]
+    elif args.dataset_type == "tnt":
+        images, poses, render_poses, hwf, i_split = load_tnt_data(
+            dataset_path,
+            args.image_downscale_factor,
+            args.image_downscale_filter,
+            args.testskip,
+            args.scene_scale,
+            args.scene_rot_z_deg,
+        )
+        print('Loaded tanks and temples', images.shape, render_poses.shape, hwf, dataset_path)
+        i_train, i_test = i_split
+        i_val = None
+
+        near = 2.
+        far = 6.
     else:
         raise RuntimeError(f'Unknown dataset type {args.dataset_type} exiting')
 
@@ -1365,13 +1496,16 @@ def train():
 
     # precompute all rays
     poses = torch.Tensor(poses)
+
     ds_rays_o, ds_rays_d, ds_near, ds_far, ds_target = [], [], [], [], []
+    ds_rays_radii, ds_rays_d_unnorm = [], []
+    ds_rays_dx, ds_rays_dy = [], []
     for img_i in i_train:
         target = images[img_i]
         target = torch.Tensor(target)
         pose = poses[img_i, :3, :4]
 
-        rays_o, rays_d, near, far, valid_mask = get_rays(
+        rays_o, rays_d, near, far, valid_mask, radii, rays_d_unnorm, rays_dx, rays_dy = get_rays(
             H, W, K, pose, dir_center_pix=args.dir_center_pix, valid_only=args.filter_rays,
         )
 
@@ -1385,12 +1519,20 @@ def train():
         ds_near.append(near)
         ds_far.append(far)
         ds_target.append(target)
+        ds_rays_radii.append(radii)
+        ds_rays_d_unnorm.append(rays_d_unnorm)
+        ds_rays_dx.append(rays_dx)
+        ds_rays_dy.append(rays_dy)
     
     ds_rays_o = torch.cat(ds_rays_o, dim=0)
     ds_rays_d = torch.cat(ds_rays_d, dim=0)
     ds_near = torch.cat(ds_near, dim=0)
     ds_far = torch.cat(ds_far, dim=0)
     ds_target = torch.cat(ds_target, dim=0)
+    ds_rays_radii = torch.cat(ds_rays_radii, dim=0)
+    ds_rays_d_unnorm = torch.cat(ds_rays_d_unnorm, dim=0)
+    ds_rays_dx = torch.cat(ds_rays_dx, dim=0)
+    ds_rays_dy = torch.cat(ds_rays_dy, dim=0)
 
     if args.normalize:
         model.target_mean = ds_target.mean()
@@ -1439,12 +1581,16 @@ def train():
         rays_o = ds_rays_o[ids].to(args.device)
         rays_d = ds_rays_d[ids].to(args.device)
         target = ds_target[ids].to(args.device)
+        rays_d_unnorm = ds_rays_d_unnorm[ids].to(args.device)
+        radii = ds_rays_radii[ids].to(args.device)
+        rays_dx = ds_rays_dx[ids].to(args.device)
+        rays_dy = ds_rays_dy[ids].to(args.device)
         if args.adjust_near_far:
             near = ds_near[ids].to(args.device)
             far = ds_far[ids].to(args.device)
-            batch_rays = [rays_o, rays_d, near, far]
+            batch_rays = [rays_o, rays_d, near, far, radii, rays_d_unnorm, rays_dx, rays_dy]
         else:
-            batch_rays = [rays_o, rays_d]
+            batch_rays = [rays_o, rays_d, radii, rays_d_unnorm, rays_dx, rays_dy]
 
         # if args.use_EM != 0:
         #     if args.use_EM == 1:

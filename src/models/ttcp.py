@@ -78,7 +78,10 @@ class TTCPNF(BaseNF):
             younger_xyz[None,:,None,None,:].detach(),
             align_corners=True, mode='bilinear').view(-1, num_samples)
 
-        return self.B((A * B).T)
+        if self.output_features != 1:
+            return self.B((A * B).T)
+        else:
+            return (A * B).T.sum(dim=1, keepdim=True)
 
     def contract(self):
         return torch.einsum(

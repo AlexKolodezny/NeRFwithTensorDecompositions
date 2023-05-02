@@ -20,6 +20,8 @@ from ..models.ttnf2 import TTNF
 from ..models.ttcp import TTCPNF
 from ..models.tttacker import TTTackerNF
 from ..models.vttm import VTTMNF
+from ..models.kronecker import KroneckerNF
+from ..models.cp import CPNF
 
 from ..models.spherical_harmonics import spherical_harmonics_bases
 
@@ -38,6 +40,8 @@ model_dict = {
     "TTCPNF": TTCPNF,
     "TTTackerNF": TTTackerNF,
     "VTTMNF": VTTMNF,
+    "KroneckerNF": KroneckerNF,
+    "CPNF": CPNF,
 }
 
 class ShaderBase(torch.nn.Module):
@@ -315,8 +319,10 @@ class RadianceField(torch.nn.Module):
             t_rand = torch.rand(z_vals.shape, device=device)
             z_vals = lower + (upper - lower) * t_rand
 
-        dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
         pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
+
+        z_vals = (z_vals * (self.args.dim_grid - 1) * 0.5).detach()
+        dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
 
         B, R, _ = pts.shape
         coords_xyz = pts.view(B * R, 3)
@@ -360,6 +366,7 @@ class RadianceField(torch.nn.Module):
             raw_rgb = self.shader(pts[app_mask], viewdirs[:,None,:].repeat(1, R, 1)[app_mask], raw_rgb)
 
             rgb[app_mask] = raw_rgb
+
         
         if self.args.use_rgb_sigmoid:
             rgb = torch.sigmoid(rgb)  # NR x NS x 3

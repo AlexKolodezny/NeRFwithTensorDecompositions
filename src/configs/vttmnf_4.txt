@@ -1,4 +1,4 @@
-expname = vttmnf_grid_512
+expname = vttmnf_4
 dataset_dir = lego
 dataset_type = blender
 dataset_root = data
@@ -6,7 +6,7 @@ log_root = log
 
 white_bkgd = True
 
-device=cuda:0
+device=cuda:2
 
 lrate = 3e-3
 lrate_decay = 80000
@@ -14,7 +14,7 @@ lrate_warmup_steps = 1000
 N_samples = 512
 N_importance = 0
 N_rand = 4096
-N_iters = 80000
+N_iters = 160000
 i_img = 2000
 i_img_ids = [1]
 i_testset = 40000
@@ -28,7 +28,7 @@ image_downscale_factor = 1
 image_downscale_filter = antialias
 scene_scale = 0.8
 
-dim_grid = 512
+dim_grid = 256
 
 models = '{"rgb": {"model": "VTTMNF","cp_rank": 64, "tt_rank": 48, "return_mask": 1, "scale": 0.1}}'
 sigma_warmup_sts=0

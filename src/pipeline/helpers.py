@@ -339,6 +339,7 @@ def intersect_rays_aabb(rays_o, rays_d, compute_valid=False, eps=0.01):
     t1 = (lb - rays_o) * invdirs
     t2 = (rt - rays_o) * invdirs
     near = torch.max(torch.min(t1, t2), dim=-1).values
+    near = torch.maximum(near, torch.tensor(1e-4))
     far = torch.min(torch.max(t1, t2), dim=-1).values
     if compute_valid:
         valid_mask = (far >= 0) & (near < far)
@@ -364,8 +365,8 @@ def get_rays(H, W, K, c2w, dir_center_pix=True, valid_only=True):
     """
     device = c2w.device
     i, j = torch.meshgrid(
-        torch.linspace(0, W - 1, W, device=device),
-        torch.linspace(0, H - 1, H, device=device),
+        torch.linspace(0, W, W + 1, device=device),
+        torch.linspace(0, H, H + 1, device=device),
         indexing='xy'
     )
     if dir_center_pix:
@@ -376,7 +377,12 @@ def get_rays(H, W, K, c2w, dir_center_pix=True, valid_only=True):
         dirs = torch.stack([(i - K[0][2]) / K[0][0], -(j - K[1][2]) / K[1][1], -torch.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
     rays_d = torch.sum(dirs[..., None, :] * c2w[:3, :3], -1)  # dot product eq: [c2w.dot(dir) for dir in dirs]
+    dx = rays_d[:-1,:-1,...] - rays_d[:-1,1:,...]
+    dy = rays_d[:-1,:-1,...] - rays_d[1:,:-1,...]
+    rays_d = rays_d[:-1,:-1,...]
+    rays_d_unnorm = rays_d
     rays_d = rays_d / rays_d.norm(dim=-1, keepdim=True)
+    radii = 0.5 * (torch.norm(dx, dim=-1) + torch.norm(dy, dim=-1)) * 2 / 12**0.5
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     rays_o = c2w[:3, -1].expand(rays_d.shape)
     if valid_only:
@@ -385,14 +391,22 @@ def get_rays(H, W, K, c2w, dir_center_pix=True, valid_only=True):
         rays_d = rays_d[valid_mask]
         near = near[valid_mask].unsqueeze(-1)
         far = far[valid_mask].unsqueeze(-1)
+        radii = radii[valid_mask]
+        rays_d_unnorm = rays_d_unnorm[valid_mask]
+        dx = dx[valid_mask]
+        dy = dy[valid_mask]
     else:
         near, far = intersect_rays_aabb(rays_o, rays_d, compute_valid=False)
         rays_o = rays_o.view(-1, 3)
         rays_d = rays_d.view(-1, 3)
         near = near.view(-1, 1)
         far = far.view(-1, 1)
+        radii = radii.view(-1, 1)
+        rays_d_unnorm = rays_d_unnorm.view(-1, 3)
+        dx = dx.view(-1, 3)
+        dy = dy.view(-1, 3)
         valid_mask = None
-    return rays_o, rays_d, near, far, valid_mask
+    return rays_o, rays_d, near, far, valid_mask, radii, rays_d_unnorm, dx, dy
 
 
 def ndc_rays(H, W, focal, near, rays_o, rays_d):
