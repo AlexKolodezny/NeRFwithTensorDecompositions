@@ -1,0 +1,48 @@
+expname = vmnf_skeletonnf_truck_debug
+dataset_dir = tat_training_Truck
+dataset_type = tnt
+dataset_root = data
+log_root = log
+# sample_points = ndc
+# unbounded = 1
+
+white_bkgd = False
+
+device=cuda:2
+
+lrate = 3e-3
+lrate_decay = 40000
+lrate_warmup_steps = 0
+N_samples = 512
+N_importance = 0
+N_rand = 4096
+N_iters = 40000
+i_img = 2000
+i_img_ids = [1]
+i_testset = 1000
+i_video = 100000
+i_print=10
+i_wandb=0
+
+# train_size = 4096
+train_images = [0, 1, 2]
+
+lossfn = mse
+
+testskip=1
+image_downscale_factor = 1
+image_downscale_filter = antialias
+scene_scale = 0.8
+
+dim_grid = 128
+fine_dim_grid = 128
+sh_basis_dim = 9
+fine_sh_basis_dim = 9
+
+# models = '{"rgb": {"model": "VMNF","vm_rank": 53},"sigma": {"model": "SkeletonNF","skeleton_rank": 16, "scale": 0.1}, "fine_rgb": {"model": "VMNF","vm_rank": 53},"fine_sigma": {"model": "SkeletonNF","skeleton_rank": 16, "scale": 0.1}}'
+models = '{"rgb": {"model": "VMNF","vm_rank": 53},"sigma": {"model": "SkeletonNF","skeleton_rank": 16, "scale": 0.1}}'
+use_new_march_rays=1
+weight_threshold=0.0001
+sigma_warmup_sts=0
+dtype = float32
+checks = 0

@@ -44,6 +44,17 @@ model_dict = {
     "CPNF": CPNF,
 }
 
+def s_to_t(sdist, t_near, t_far):
+    f_fwd = lambda x: torch.where(x < 1, 0.5 * x, 1 - 0.5 / x)
+    f_inv = lambda x: torch.where(x < 0.5, 2 * x, 0.5 / (1 - x))
+    return f_inv(sdist * f_fwd(t_far) + (1 - sdist) * f_fwd(t_near))
+
+
+def contract(pts):
+    norm = torch.abs(pts).amax(dim=-1, keepdim=True)
+    x = torch.where(norm <= 1, pts, (2 - 1 / norm) * (pts / norm))
+    return x / 2
+
 class ShaderBase(torch.nn.Module):
     def forward(self, coords_xyz, viewdirs, feat_color):
         """
@@ -158,8 +169,13 @@ class RadianceField(torch.nn.Module):
 
         self.dtype_sz_bytes = 4
 
+        models_config = json.loads(args.models)
+        self.models_config = models_config
+
         if args.shading_mode == 'spherical_harmonics':
             self.shader = ShaderSphericalHarmonics(args.sh_basis_dim, checks=args.checks)
+            if "fine_sigma" in self.models_config:
+                self.fine_shader = ShaderSphericalHarmonics(args.fine_sh_basis_dim, checks=args.checks)
         elif args.shading_mode == 'mlp':
             self.shader = ShaderMLP(args.rgb_feature_dim)
         elif args.shading_mode == "indetity":
@@ -228,8 +244,6 @@ class RadianceField(torch.nn.Module):
         #         raise ValueError(f'Invalid voxel grid type "{args.grid_type}"')
         # else:
 
-        models_config = json.loads(args.models)
-        self.models_config = models_config
         def create_model_kwargs(model_config):
             config = deepcopy(model_config)
             del config["model"]
@@ -243,6 +257,14 @@ class RadianceField(torch.nn.Module):
             self.vox_sigma = model_dict[models_config["sigma"]["model"]](
                 args.dim_grid, 1, **create_model_kwargs(models_config["sigma"])
             )
+            if "fine_sigma" in models_config:
+                fine_dim_payload = 3 * (args.fine_sh_basis_dim if args.use_viewdirs else 1)
+                self.fine_rgb = model_dict[models_config["rgb"]["model"]](
+                    args.fine_dim_grid, fine_dim_payload, **create_model_kwargs(models_config["fine_rgb"])
+                )
+                self.fine_sigma = model_dict[models_config["sigma"]["model"]](
+                    args.fine_dim_grid, 1, **create_model_kwargs(models_config["fine_sigma"])
+                )
         else:
             dim_payload = 1 + 3 * (args.sh_basis_dim if args.use_viewdirs else 1)
             self.vox_rgb = model_dict[models_config["rgb"]["model"]](
@@ -305,10 +327,19 @@ class RadianceField(torch.nn.Module):
         near, far = ray_batch[:, 6:7], ray_batch[:, 7:8]
         viewdirs = rays_d.clone()
 
-        t_far = torch.linspace(0., 1.0, steps=N_samples, device=device)
-        t_near = 1.0 - t_far
-        z_vals = near * t_near + far * t_far
-        z_vals = z_vals.expand([N_rays, N_samples])
+        if self.args.sample_points == 'adjusted':
+            t_far = torch.linspace(0., 1.0, steps=N_samples, device=device)
+            t_near = 1.0 - t_far
+            z_vals = near * t_near + far * t_far
+            z_vals = z_vals.expand([N_rays, N_samples])
+        elif self.args.sample_points == "ndc":
+            t_near = torch.ones_like(near) * 0.1
+            t_far = torch.ones_like(far) * 1e6
+            t_dist = torch.linspace(0., 1.0, steps=N_samples, device=device)
+            z_vals = s_to_t(t_dist, t_near, t_far)
+            assert torch.all(z_vals[...,1:] - z_vals[...,:-1] >= 0)
+            assert torch.all(z_vals >= 0)
+        
 
         if self.args.perturb:
             # get intervals between samples
@@ -325,9 +356,14 @@ class RadianceField(torch.nn.Module):
         dists = z_vals[..., 1:] - z_vals[..., :-1]  # NR x (NS-1)
 
         B, R, _ = pts.shape
-        coords_xyz = pts.view(B * R, 3)
+
+        if self.args.unbounded:
+            pts = contract(pts)
+        
+        fine_pts = pts * 2
 
         mask = torch.all(pts >= -1, dim=-1) & torch.all(pts <= 1, dim=-1)
+        fine_mask = torch.all(fine_pts >= -1, dim=-1) & torch.all(fine_pts <= 1, dim=-1)
 
         sigma = torch.zeros(B, R, device=pts.device, dtype=pts.dtype)
         if mask.any():
@@ -335,11 +371,14 @@ class RadianceField(torch.nn.Module):
                 raw_sigma = self.vox_sigma(pts[mask].detach()).view(-1)
             else:
                 raw_sigma = self.vox_rgb.calc_sigma(pts[mask].detach())
-            
-            sigma[mask] = raw_sigma
+            sigma[mask] += raw_sigma
+
+        if "fine_sigma" in self.models_config and fine_mask.any():
+            raw_sigma = self.fine_sigma(fine_pts[fine_mask].detach()).view(-1)
+            sigma[fine_mask] += raw_sigma
         
-        # if self.args.sigma_warmup_sts and cur_step <= self.args.sigma_warmup_numsteps:
-        #     sigma = sigma * (cur_step / self.args.sigma_warmup_numsteps)
+        if cur_step is not None and self.args.sigma_warmup_sts and cur_step <= self.args.sigma_warmup_numsteps:
+            sigma = sigma * (cur_step / self.args.sigma_warmup_numsteps)
 
         if self.args.sigma_activation == 'relu':
             sigma = F.relu(sigma.clone())  # NR x NS
@@ -351,8 +390,10 @@ class RadianceField(torch.nn.Module):
             weights = integrate_fn(sigma, dists)  # NR x NS
         
         app_mask = mask
+        fine_app_mask = fine_mask
         if self.args.weight_threshold is not None:
             app_mask = app_mask & (weights > self.args.weight_threshold)
+            fine_app_mask = fine_app_mask & (weights > self.args.weight_threshold)
         
         # weights[~app_mask] = 0
         rgb = torch.zeros(B, R, 3, device=pts.device, dtype=pts.dtype)
@@ -367,6 +408,10 @@ class RadianceField(torch.nn.Module):
 
             rgb[app_mask] = raw_rgb
 
+        if "fine_sigma" in self.models_config and fine_app_mask.any():
+            raw_rgb = self.fine_rgb(fine_pts[fine_app_mask])
+            raw_rgb = self.fine_shader(fine_pts[fine_app_mask], viewdirs[:,None,:].repeat(1, R, 1)[fine_app_mask], raw_rgb)
+            rgb[fine_app_mask] += raw_rgb
         
         if self.args.use_rgb_sigmoid:
             rgb = torch.sigmoid(rgb)  # NR x NS x 3

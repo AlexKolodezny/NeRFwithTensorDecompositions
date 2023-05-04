@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 from PIL import Image
+from itertools import islice
 
 def open_file(pth, mode='r'):
     return open(pth, mode=mode)
@@ -75,20 +76,21 @@ def load_tnt_data(
 
     for split_str in splits:
       basedir = os.path.join(data_dir, split_str)
-      def load_files(dirname, load_fn, shape=None):
-          files = [
-              os.path.join(basedir, dirname, f)
-              for f in sorted(listdir(os.path.join(basedir, dirname)))
-          ]
-          mats = np.array([load_fn(open_file(f, 'rb')) for f in files])
-          if shape is not None:
-              mats = mats.reshape(mats.shape[:1] + shape)
-          return mats
 
       if split_str == 'train' or testskip == 0:
           skip = 1
       else:
           skip = testskip
+
+      def load_files(dirname, load_fn, shape=None):
+          files = [
+              os.path.join(basedir, dirname, f)
+              for f in islice(sorted(listdir(os.path.join(basedir, dirname))), 0, None, skip)
+          ]
+          mats = np.array([load_fn(open_file(f, 'rb')) for f in files])
+          if shape is not None:
+              mats = mats.reshape(mats.shape[:1] + shape)
+          return mats
 
       poses = load_files('pose', np.loadtxt, (4, 4))
       # Flip Y and Z axes to get correct coordinate frame.

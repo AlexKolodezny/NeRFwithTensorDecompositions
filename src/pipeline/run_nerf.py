@@ -16,9 +16,6 @@ from .load_tnt import load_tnt_data
 from .radiance_field import RadianceField
 from ..models.spherical_harmonics import spherical_harmonics_bases
 
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-# device = "cpu"
-
 def create_model(args):
     model = RadianceField(args)
     print(model)
@@ -1183,6 +1180,7 @@ def config_parser():
                         help='options: blender')
     parser.add_argument("--dataset_dir", type=str,
                         help='a subdirectory within the specified dataset type')
+    parser.add_argument("--unbounded", type=int, default=0)
 
     parser.add_argument("--device", type=str, default='cpu',
                         help='device to use')
@@ -1196,6 +1194,7 @@ def config_parser():
                         help='model of voxel frid')
     parser.add_argument("--dim_grid", type=int, default=256,
                         help='size of voxel grid')
+    parser.add_argument("--fine_dim_grid", type=int, default=256)
     parser.add_argument("--init_method", type=str, default='normal', choices=('normal', 'zeros', 'eye'),
                         help='voxel grid initialization')
     parser.add_argument("--grid_type", type=str, default='fused', choices=('fused', 'separate'),
@@ -1207,7 +1206,7 @@ def config_parser():
     parser.add_argument("--dist_constant", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--use_new_march_rays", type=int, default=0)
-    parser.add_argument("--sample_points", type=str, default='adjusted', choices=('equal', 'adjusted', 'grid'))
+    parser.add_argument("--sample_points", type=str, default='adjusted', choices=('equal', 'adjusted', 'grid', 'ndc'))
     parser.add_argument("--use_EM", type=int, default=0)
     parser.add_argument("--normalize", type=int, default=0)
     parser.add_argument("--intersect_threshold", type=float, default=1e-2)
@@ -1272,6 +1271,8 @@ def config_parser():
                         help='loss function to use during training')
     parser.add_argument("--train_size", type=int, default=None,
                         help='number of rays for train')
+    parser.add_argument("--train_images", nargs="+", type=int, default=None)
+    parser.add_argument("--log_train_images", nargs="+", type=int, default=None)
     parser.add_argument("--optimizer", type=str, default="Adam", choices=('Adam', 'SGD', 'SeparatedSGD', 'LBFGS', 'SeparatedLBFGS'),
                         help='specify optimizer')
     parser.add_argument("--momentum", type=float, default=0)
@@ -1300,6 +1301,7 @@ def config_parser():
                         help='Select shading mode for RGB values')
     parser.add_argument("--sh_basis_dim", type=int, default=9,
                         help='spherical harmonics basis dimension per channel')
+    parser.add_argument("--fine_sh_basis_dim", type=int, default=9)
     parser.add_argument("--rgb_feature_dim", type=int, default=27,
                         help='RGB feature vector dimension')
     parser.add_argument("--dir_center_pix", type=int, default=1,
@@ -1500,6 +1502,8 @@ def train():
     ds_rays_o, ds_rays_d, ds_near, ds_far, ds_target = [], [], [], [], []
     ds_rays_radii, ds_rays_d_unnorm = [], []
     ds_rays_dx, ds_rays_dy = [], []
+    if args.train_images is not None:
+        i_train = args.train_images
     for img_i in i_train:
         target = images[img_i]
         target = torch.Tensor(target)
@@ -1870,10 +1874,11 @@ def train():
                 torch.Tensor(poses[i_test]), hwf, K, args.chunk, render_kwargs_test,
                 gt_imgs=images[i_test], savedir=testsavedir, compute_stats=True, desc='test set', device=args.device
             )
-            # _, train_psnr, train_mse, train_ssim, train_lpips = render_path(
-            #     torch.Tensor(poses[i_train]), hwf, K, args.chunk, render_kwargs_train,
-            #     gt_imgs=images[i_train], savedir=trainsavedir, compute_stats=True, desc='train set', device=args.device
-            # )
+            if args.log_train_images is not None:
+                _, train_psnr, train_mse, train_ssim, train_lpips = render_path(
+                    torch.Tensor(poses[args.log_train_images]), hwf, K, args.chunk, render_kwargs_train,
+                    gt_imgs=images[args.log_train_images], savedir=trainsavedir, compute_stats=True, desc='train set', device=args.device
+                )
             model.train()
 
             wandb.log({
@@ -1898,7 +1903,7 @@ def train():
             # }, global_step=i)
 
             tqdm.write(f"[TEST] Iter: {i} of {args.N_iters}, PSNR: {test_psnr}, SSIM: {test_ssim}, LPIPS: {test_lpips}")
-            # tqdm.write(f"[TRAIN] Iter: {i} of {args.N_iters}, PSNR: {train_psnr}, SSIM: {train_ssim}, LPIPS: {train_lpips}")
+            tqdm.write(f"[TRAIN] Iter: {i} of {args.N_iters}, PSNR: {train_psnr}, SSIM: {train_ssim}, LPIPS: {train_lpips}")
 
         global_step += 1
 
