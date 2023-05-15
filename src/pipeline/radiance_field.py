@@ -185,65 +185,6 @@ class RadianceField(torch.nn.Module):
         self.shader_num_params = sum(torch.tensor(a.shape).prod().item() for a in self.shader.parameters())
 
 
-        # if args.models is None:
-        #     if args.model == "QTTNF" or args.model == "TTNF":
-        #         kwargs = dict(
-        #             tt_rank_max=args.tt_rank_max,
-        #             sample_by_contraction=args.sample_by_contraction,
-        #             tt_rank_equal=args.tt_rank_equal,
-        #             tt_minimal_dof=args.tt_minimal_dof,
-        #             init_method=args.init_method,
-        #             outliers_handling='zeros',
-        #             expected_sample_batch_size=args.N_rand * (args.N_samples + args.N_importance),
-        #             version_sample_qtt=args.sample_qtt_version,
-        #             dtype={
-        #                 'float16': torch.float16,
-        #                 'float32': torch.float32,
-        #                 'float64': torch.float64,
-        #             }[args.dtype],
-        #             checks=args.checks,
-        #             verbose=True,
-        #         )
-        #         model=QTTNF
-        #     elif args.model == "TackerNF":
-        #         model = TackerNF
-        #         kwargs = dict(
-        #             tacker_rank=args.tacker_rank,
-        #             outliers_handling='zeros',
-        #         )
-        #     elif args.model == "VMNF":
-        #         model = VMNF
-        #         kwargs = dict(
-        #             vm_rank=args.vm_rank,
-        #             outliers_handling='zeros',
-        #         )
-        #     elif args.model == "SkeletonNF":
-        #         model = SkeletonNF
-        #         kwargs = dict(
-        #             skeleton_rank=args.skeleton_rank,
-        #             outliers_handling='zeros',
-        #         )
-        #     elif args.model == "FullNF":
-        #         model = FullNF
-        #         kwargs = dict(
-        #             outliers_handling='zeros',
-        #         )
-
-        #     if args.grid_type == 'fused':
-        #         # opacity + 3 * (# sh or a float per channel)
-        #         dim_payload = 1 + 3 * (args.sh_basis_dim if args.use_viewdirs else 1)
-        #         self.vox_fused = model(args.dim_grid, dim_payload, **kwargs)
-        #     elif args.grid_type == 'separate':
-        #         # 3 * (# sh or a float per channel)
-        #         dim_payload = 3 * (args.sh_basis_dim if args.use_viewdirs else 1)
-        #         self.vox_rgb = model(
-        #             args.dim_grid, dim_payload, **kwargs
-        #         )
-        #         self.vox_sigma = model(args.dim_grid, 1, **kwargs)  # opacity
-        #     else:
-        #         raise ValueError(f'Invalid voxel grid type "{args.grid_type}"')
-        # else:
-
         def create_model_kwargs(model_config):
             config = deepcopy(model_config)
             del config["model"]
@@ -304,15 +245,6 @@ class RadianceField(torch.nn.Module):
             var = self.vox_var(coords_xyz)
             var = var.view(B, R)
             var = torch.cat([var, self.bkgd_var.expand(B, 1)], dim=1)
-
-        # elif self.args.grid_type == 'fused':
-        #     tmp = self.vox_fused(coords_xyz)
-        #     rgb, sigma = tmp[..., :-1], tmp[..., -1]  # B x R x 3 * (SH or 1), B x R
-        # elif self.args.grid_type == 'separate':
-        #     rgb = self.vox_rgb(coords_xyz)
-        #     sigma = self.vox_sigma(coords_xyz)
-        # else:
-        #     raise ValueError(f'Invalid grid type: "{self.args.grid_type}"')
 
         return rgb, sigma, var, mask
     
@@ -451,16 +383,6 @@ class RadianceField(torch.nn.Module):
                 {'tag': 'vox', 'params': self.vox_var.parameters(), 'lr': self.args.lrate},
             ]
 
-        # elif self.args.grid_type == 'fused':
-        #     out += [
-        #         {'tag': 'vox', 'params': self.vox_fused.parameters(), 'lr': self.args.lrate},
-        #     ]
-        # elif self.args.grid_type == 'separate':
-        #     out += [
-        #         {'tag': 'vox', 'params': self.vox_rgb.parameters(), 'lr': self.args.lrate},
-        #         {'tag': 'vox', 'params': self.vox_sigma.parameters(), 'lr':
-        #             self.args.lrate * self.args.lrate_sigma_multiplier},
-        #     ]
         if self.args.shading_mode == "mlp":
             out += [
                 {'tag': 'shader', 'params': self.shader.parameters(), 'lr': self.args.lrate_shader},
